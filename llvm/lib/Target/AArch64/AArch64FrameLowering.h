@@ -62,6 +62,9 @@ public:
   /// Can this function use the red zone for local allocations.
   bool canUseRedZone(const MachineFunction &MF) const;
 
+  /// To pass the option Goframe frome AArch64FrameLowering to other passes
+  bool isGoFrameEnabled() const;
+
   bool hasFP(const MachineFunction &MF) const override;
   bool hasReservedCallFrame(const MachineFunction &MF) const override;
 

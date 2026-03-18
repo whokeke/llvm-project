@@ -301,6 +301,10 @@ static bool needsWinCFI(const MachineFunction &MF);
 static StackOffset getSVEStackSize(const MachineFunction &MF);
 static Register findScratchNonCalleeSaveRegister(MachineBasicBlock *MBB);
 
+bool AArch64FrameLowering::isGoFrameEnabled() const {
+    return GoFrame;
+}
+
 /// Returns true if a homogeneous prolog or epilog code can be emitted
 /// for the size optimization. If possible, a frame helper call is injected.
 /// When Exit block is given, this check is for epilog.
@@ -1769,6 +1773,12 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
 
   const StackOffset &SVEStackSize = getSVEStackSize(MF);
 
+  if (GoFrame && SVEStackSize) {
+    if (!MF.getSubtarget<AArch64Subtarget>().isXRegisterReserved(9))
+      report_fatal_error("When using -go-frame with SVE stack objects, X9 must be reserved; "
+		         "compile with -ffixed-x9.");
+  }
+
   // getStackSize() includes all the locals in its size calculation. We don't
   // include these locals when computing the stack size of a funclet, as they
   // are allocated in the parent's stack frame and accessed via the frame
@@ -1860,8 +1870,8 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   if (!IsFunclet && HasFP) {
     // Only set up FP if we actually need to.
     int64_t FPOffset = -8;
-
-    if (!GoFrame) {
+    // We need the real FPOffset because FP is used to access SVE objects.
+    if (!GoFrame || (GoFrame && SVEStackSize)) {
       FPOffset = AFI->getCalleeSaveBaseToFrameRecordOffset();
       if (CombineSPBump)
         FPOffset += AFI->getLocalStackSize();
@@ -1897,22 +1907,22 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
       assert(Prolog->getOpcode() == AArch64::HOM_Prolog);
       Prolog->addOperand(MachineOperand::CreateImm(FPOffset));
     } else {
-      // Store a copy of FP & LR at stack top for Go frames.
-      if (GoFrame) {
-        BuildMI(MBB, MBBI, DL, TII->get(AArch64::STPXi))
-          .addDef(AArch64::FP)
-          .addUse(AArch64::LR)
-          .addUse(AArch64::SP)
-          .addImm(NumBytes / 8 - 1)
-          .setMIFlag(MachineInstr::FrameSetup);
-      }
       // Issue    sub fp, sp, FPOffset or
       //          mov fp,sp          when FPOffset is zero.
       // Note: All stores of callee-saved registers are marked as "FrameSetup".
       // This code marks the instruction(s) that set the FP also.
-      emitFrameOffset(MBB, MBBI, DL, AArch64::FP, AArch64::SP,
+      if (GoFrame && SVEStackSize) {
+        // When GoFrame meets SVE, X9 is used as the FP to visit SVE object.
+        emitFrameOffset(MBB, MBBI, DL, AArch64::X9, AArch64::SP,
                       StackOffset::getFixed(FPOffset), TII,
                       MachineInstr::FrameSetup, false, NeedsWinCFI, &HasWinCFI);
+      } else if (!GoFrame) {
+        // Move the store a copy of FP & LR at stack top for Go frames after SVE,
+        // do not get the FP here when GoFrame.
+          emitFrameOffset(MBB, MBBI, DL, AArch64::FP, AArch64::SP,
+                      StackOffset::getFixed(FPOffset), TII,
+                      MachineInstr::FrameSetup, false, NeedsWinCFI, &HasWinCFI);
+      }
       if (NeedsWinCFI && HasWinCFI) {
         BuildMI(MBB, MBBI, DL, TII->get(AArch64::SEH_PrologEnd))
             .setMIFlag(MachineInstr::FrameSetup);
@@ -2125,6 +2135,41 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
       BuildMI(MBB, MBBI, DL, TII->get(AArch64::SEH_Nop))
           .setMIFlag(MachineInstr::FrameSetup);
     }
+  }
+
+  // |-----------------------------------|
+  // |                                   |
+  // |        SVE stack objects          |
+  // |                                   |
+  // |-----------------------------------|
+  // | empty area for 16-bytes alignment | <- 8 bytes
+  // |               LR                  | <- 8 bytes
+  // |-----------------------------------| <- SP
+  // |               FP                  | <- FP
+  if (GoFrame) {
+    // After SVE object, a new 16-bytes slot is needed to store LR and FP.
+    // To fix the overlap area between GoFrame and SVE.
+    if (SVEStackSize) {
+      emitFrameOffset(MBB, MBBI, DL, AArch64::SP, AArch64::SP,
+                  StackOffset::getFixed(-16), TII,
+                  MachineInstr::FrameSetup, false, NeedsWinCFI, &HasWinCFI,
+                  EmitAsyncCFI);
+    }
+
+    // Store a copy of FP & LR at stack top for Go frames.
+    auto MIB = BuildMI(MBB, MBBI, DL, TII->get(AArch64::STPXi));
+    MIB.addReg(AArch64::FP, RegState::Kill)
+       .addReg(AArch64::LR, RegState::Kill)
+       .addReg(AArch64::SP)
+       .addImm(-1)
+       .addMemOperand(MF.getMachineMemOperand(
+           MachinePointerInfo::getStack(MF, -16),
+	   MachineMemOperand::MOStore, 16, Align(16)))
+       .setMIFlag(MachineInstr::FrameSetup);
+    // As the Go ABI, the FP should be in the SP-8.
+    emitFrameOffset(MBB, MBBI, DL, AArch64::FP, AArch64::SP,
+                        StackOffset::getFixed(-8), TII,
+                        MachineInstr::FrameSetup, false, NeedsWinCFI, &HasWinCFI);
   }
 
   // The very last FrameSetup instruction indicates the end of prologue. Emit a
@@ -2371,7 +2416,9 @@ void AArch64FrameLowering::emitEpilogue(MachineFunction &MF,
                     StackOffset::getFixed(NumBytes + (int64_t)AfterCSRPopSize),
                     TII, MachineInstr::FrameDestroy, false, NeedsWinCFI,
                     &HasWinCFI, EmitCFI, StackOffset::getFixed(NumBytes));
-    return;
+    // In GoFrame, should deallocate the extra 16 bytes and SVE even with SPBump.  
+    if (!GoFrame)
+      return;
   }
 
   NumBytes -= PrologueSaveSize;
@@ -2394,6 +2441,14 @@ void AArch64FrameLowering::emitEpilogue(MachineFunction &MF,
         StackOffset::getScalable(CalleeSavedSize);
     DeallocateBefore = SVEStackSize - CalleeSavedSizeAsOffset;
     DeallocateAfter = CalleeSavedSizeAsOffset;
+  }
+
+  // Deallocate the extra 16-bytes area keeping FP and LR.
+  if (GoFrame && SVEStackSize) {
+    emitFrameOffset(MBB, RestoreBegin, DL, AArch64::SP, AArch64::SP,
+                   StackOffset::getFixed(16),
+                   TII, MachineInstr::FrameDestroy, false, NeedsWinCFI,
+                   &HasWinCFI, EmitCFI, StackOffset::getFixed(NumBytes));
   }
 
   // Deallocate the SVE area.
@@ -2436,6 +2491,11 @@ void AArch64FrameLowering::emitEpilogue(MachineFunction &MF,
     }
     if (EmitCFI)
       emitCalleeSavedSVERestores(MBB, RestoreEnd);
+  }
+
+  // With the SPBump, after dellocate SVE and extra area, epilogue done.
+  if (GoFrame) {
+    return;
   }
 
   if (!hasFP(MF)) {

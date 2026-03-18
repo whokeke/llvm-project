@@ -638,6 +638,11 @@ bool AArch64RegisterInfo::isArgumentRegister(const MachineFunction &MF,
 Register
 AArch64RegisterInfo::getFrameRegister(const MachineFunction &MF) const {
   const AArch64FrameLowering *TFI = getFrameLowering(MF);
+  // We use X9 as the real FP to visit SVE object.
+  // So the option -ffixed-x9 is needed.
+  const AArch64FunctionInfo *AFI = MF.getInfo<AArch64FunctionInfo>();
+  if (TFI->isGoFrameEnabled() && AFI->getStackSizeSVE())
+    return TFI->hasFP(MF) ? AArch64::X9 : AArch64::SP;
   return TFI->hasFP(MF) ? AArch64::FP : AArch64::SP;
 }
 

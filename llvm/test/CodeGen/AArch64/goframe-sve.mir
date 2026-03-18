@@ -1,0 +1,67 @@
+#RUN: llc -mtriple=aarch64-none-linux-gnu -run-pass=prologepilog %s -o - | FileCheck %s --check-prefix=NOGOFRAME
+#RUN: llc -mtriple=aarch64-none-linux-gnu -run-pass=prologepilog -go-frame -mattr=+reserve-x9 %s -o - | FileCheck %s --check-prefix=GOFRAME
+#RUN: not --crash llc -mtriple=aarch64-none-linux-gnu -run-pass=prologepilog -go-frame %s -o - 2>&1 | FileCheck %s --check-prefix=CHECK-ERROR
+
+# CHECK-ERROR: LLVM ERROR: When using -go-frame with SVE stack objects, X9 must be reserved; compile with -ffixed-x9.
+
+# NOGOFRAME-LABEL: name: goframe-sve-test
+# NOGOFRAME: early-clobber $sp = frame-setup STRXpre killed $fp, $sp, -32 :: (store (s64) into %stack.3)
+# NOGOFRAME: frame-setup STPXi killed $x21, killed $x20, $sp, 2 :: (store (s64) into %stack.2), (store (s64) into %stack.1)
+# NOGOFRAME: $sp = frame-setup ADDVL_XXI $sp, -1
+# NOGOFRAME: frame-setup CFI_INSTRUCTION escape 0x0f, 0x0c, 0x8f, 0x00, 0x11, 0x20, 0x22, 0x11, 0x08, 0x92, 0x2e, 0x00, 0x1e, 0x22
+# NOGOFRAME: frame-setup CFI_INSTRUCTION offset $w20, -8
+# NOGOFRAME: frame-setup CFI_INSTRUCTION offset $w21, -16
+# NOGOFRAME: frame-setup CFI_INSTRUCTION offset $w29, -32
+# NOGOFRAME: $x20 = IMPLICIT_DEF
+# NOGOFRAME: $x21 = IMPLICIT_DEF
+# NOGOFRAME: renamable $w10 = MOVi32imm -1143655805
+# NOGOFRAME: renamable $z0 = DUP_ZR_S killed renamable $w10
+# NOGOFRAME: STR_ZXI killed renamable $z0, $sp, 0 :: (store (s128) into %stack.0)
+# NOGOFRAME: $sp = frame-destroy ADDVL_XXI $sp, 1
+# NOGOFRAME: $x21, $x20 = frame-destroy LDPXi $sp, 2 :: (load (s64) from %stack.2), (load (s64) from %stack.1)
+# NOGOFRAME: early-clobber $sp, $fp = frame-destroy LDRXpost $sp, 32 :: (load (s64) from %stack.3)
+# NOGOFRAME: RET_ReallyLR 
+
+# GOFRAME-LABEL: name: goframe-sve-test
+# GOFRAME: $sp = frame-setup SUBXri $sp, 48, 0
+# GOFRAME-NEXT: frame-setup STPXi killed $fp, killed $lr, $sp, 1 :: (store (s64) into %stack.5), (store (s64) into %stack.4)
+# GOFRAME-NEXT: frame-setup STPXi killed $x21, killed $x20, $sp, 3 :: (store (s64) into %stack.3), (store (s64) into %stack.2)
+# GOFRAME-NEXT: $x9 = frame-setup ADDXri $sp, 8, 0
+# GOFRAME-NEXT: $sp = frame-setup ADDVL_XXI $sp, -1
+# GOFRAME-NEXT: $sp = frame-setup SUBXri $sp, 16, 0
+# GOFRAME-NEXT: frame-setup STPXi killed $fp, killed $lr, $sp, -1 :: (store (s128) into stack - 16)
+# GOFRAME-NEXT: $fp = frame-setup SUBXri $sp, 8, 0
+# GOFRAME-NEXT: frame-setup CFI_INSTRUCTION def_cfa $w9, 24
+# GOFRAME-NEXT: frame-setup CFI_INSTRUCTION offset $w20, -16
+# GOFRAME-NEXT: frame-setup CFI_INSTRUCTION offset $w21, -24
+# GOFRAME-NEXT: frame-setup CFI_INSTRUCTION offset $w30, -32
+# GOFRAME-NEXT: frame-setup CFI_INSTRUCTION offset $w29, -40
+# GOFRAME-NEXT: $x20 = IMPLICIT_DEF
+# GOFRAME-NEXT: $x21 = IMPLICIT_DEF
+# GOFRAME-NEXT: renamable $w10 = MOVi32imm -1143655805
+# GOFRAME-NEXT: renamable $z0 = DUP_ZR_S killed renamable $w10
+# GOFRAME-NEXT: $x8 = SUBXri $x9, 8, 0
+# GOFRAME-NEXT: STR_ZXI killed renamable $z0, killed $x8, -1 :: (store (s128) into %stack.0)
+# GOFRAME-NEXT: $sp = frame-destroy ADDXri $sp, 16, 0
+# GOFRAME-NEXT: $sp = frame-destroy ADDVL_XXI $sp, 1
+# GOFRAME-NEXT: $x21, $x20 = frame-destroy LDPXi $sp, 3 :: (load (s64) from %stack.3), (load (s64) from %stack.2)
+# GOFRAME-NEXT: $fp, $lr = frame-destroy LDPXi $sp, 1 :: (load (s64) from %stack.5), (load (s64) from %stack.4)
+# GOFRAME-NEXT: $sp = frame-destroy ADDXri $sp, 48, 0
+# GOFRAME-NEXT: RET_ReallyLR
+
+---
+name:	goframe-sve-test
+tracksRegLiveness: true
+stack:
+  - { id: 0, offset: 0, size: 16, alignment: 16, stack-id: scalable-vector}
+
+body:                       |
+  bb.0.entry:
+    liveins: $x0, $x1
+    $x20 = IMPLICIT_DEF
+    $x21 = IMPLICIT_DEF
+    renamable $w10 = MOVi32imm -1143655805
+    renamable $z0 = DUP_ZR_S killed renamable $w10
+    STR_ZXI killed renamable $z0, %stack.0, 0 :: (store (s128) into %stack.0)
+    RET_ReallyLR
+...
