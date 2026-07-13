@@ -689,6 +689,7 @@ def TuneHIP12 : SubtargetFeature<"hip12", "ARMProcFamily", "HIP12",
                                  "HiSilicon HIP12 processors", [
                                  FeatureCmpBccFusion,
                                  FeatureFuseAES,
+                                 FeatureFuseLiterals,
                                  FeatureAddrLSLSlow14,
                                  FeatureALULSLFast,
                                  FeatureStorePairSuppress,
