@@ -2054,6 +2054,18 @@ AArch64TargetLowering::AArch64TargetLowering(const TargetMachine &TM,
         setOperationAction(ISD::FP_ROUND, VT, Custom);
 
       // These operations are not supported on NEON but SVE can do them.
+      setOperationAction(ISD::BITREVERSE, MVT::v1i64, Custom);
+      setOperationAction(ISD::CTLZ, MVT::v1i64, Custom);
+      setOperationAction(ISD::CTLZ, MVT::v2i64, Custom);
+      setOperationAction(ISD::CTTZ, MVT::v1i64, Custom);
+      setOperationAction(ISD::MULHS, MVT::v1i64, Custom);
+      setOperationAction(ISD::MULHS, MVT::v2i64, Custom);
+      setOperationAction(ISD::MULHU, MVT::v1i64, Custom);
+      setOperationAction(ISD::MULHU, MVT::v2i64, Custom);
+      setOperationAction(ISD::MULHS, MVT::v4i64, Custom);
+      setOperationAction(ISD::MULHU, MVT::v4i64, Custom);
+      setOperationAction(ISD::MULHS, MVT::v8i64, Custom);
+      setOperationAction(ISD::MULHU, MVT::v8i64, Custom);
       setOperationAction(ISD::SMAX, MVT::v1i64, Custom);
       setOperationAction(ISD::SMAX, MVT::v2i64, Custom);
       setOperationAction(ISD::SMIN, MVT::v1i64, Custom);
@@ -2283,6 +2295,12 @@ AArch64TargetLowering::AArch64TargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::FLDEXP, MVT::f32, Custom);
     setOperationAction(ISD::FLDEXP, MVT::f16, Custom);
     setOperationAction(ISD::FLDEXP, MVT::bf16, Custom);
+    setOperationAction(ISD::MULHU, MVT::v4i64, Custom);
+    setOperationAction(ISD::MULHS, MVT::v4i64, Custom);
+    setOperationAction(ISD::MULHU, MVT::v8i64, Custom);
+    setOperationAction(ISD::MULHS, MVT::v8i64, Custom);
+    setOperationAction(ISD::MULHU, MVT::v2i64, Custom);
+    setOperationAction(ISD::MULHS, MVT::v2i64, Custom);
   }
 
   PredictableSelectIsExpensive = Subtarget->predictableSelectIsExpensive();
@@ -8988,6 +9006,7 @@ bool AArch64TargetLowering::useSVEForFixedLengthVectorVT(
   case MVT::i16:
   case MVT::i32:
   case MVT::i64:
+  case MVT::i128:
   case MVT::f16:
   case MVT::f32:
   case MVT::f64:

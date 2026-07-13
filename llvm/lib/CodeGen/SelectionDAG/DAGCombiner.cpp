@@ -11674,6 +11674,145 @@ SDValue DAGCombiner::visitSRL(SDNode *N) {
       DAG.MaskedValueIsZero(SDValue(N, 0), APInt::getAllOnes(OpSizeInBits)))
     return DAG.getConstant(0, DL, VT);
 
+  // Combine: srl(mul(zext(a), zext(b)), BitWidth/2) -> zext(mulhu(a, b))
+  // Skip if SRL's only use is a TRUNCATE — visitTRUNCATE will handle it.
+  if (N1C && N1C->getAPIntValue() == OpSizeInBits / 2 &&
+      N0.getOpcode() == ISD::MUL && OpSizeInBits >= 64 &&
+      N0.hasOneUse()) {
+    // Check if SRL is only used by a TRUNCATE
+    bool srlUsedByTrunc = false;
+    for (auto UI = N->use_begin(), UE = N->use_end(); UI != UE; ++UI) {
+      if (UI->getUser()->getOpcode() == ISD::TRUNCATE) {
+        srlUsedByTrunc = true;
+        break;
+      }
+    }
+    if (!srlUsedByTrunc) {
+    unsigned N = OpSizeInBits / 2;
+    auto CheckZext = [&](SDValue X) -> SDValue {
+      if (X.getOpcode() == ISD::ZERO_EXTEND &&
+          X.getOperand(0).getValueType().getScalarSizeInBits() == N)
+        return X.getOperand(0);
+      if (X.getOpcode() == ISD::AND) {
+        SDValue MaskOp = X.getOperand(1);
+        APInt Mask;
+        if (auto *CN = dyn_cast<ConstantSDNode>(MaskOp.getNode()))
+          Mask = CN->getAPIntValue();
+        else if (auto *BV = dyn_cast<BuildVectorSDNode>(MaskOp.getNode())) {
+          SDValue S = BV->getSplatValue();
+          if (S && isa<ConstantSDNode>(S.getNode()))
+            Mask = cast<ConstantSDNode>(S.getNode())->getAPIntValue();
+        }
+        unsigned WideBits = X.getValueType().getScalarSizeInBits();
+        if (Mask.getBitWidth() > 0 &&
+            Mask == APInt::getLowBitsSet(WideBits, N)) {
+          SDValue AndSrc = X.getOperand(0);
+          if ((AndSrc.getOpcode() == ISD::ANY_EXTEND ||
+               AndSrc.getOpcode() == ISD::ZERO_EXTEND ||
+               AndSrc.getOpcode() == ISD::SIGN_EXTEND) &&
+              AndSrc.getOperand(0).getValueType().getScalarSizeInBits() == N)
+            return AndSrc.getOperand(0);
+        }
+      }
+      if (X.getOpcode() == ISD::BUILD_VECTOR) {
+        if (auto *BV = dyn_cast<BuildVectorSDNode>(X.getNode())) {
+          SDValue Splat = BV->getSplatValue();
+          if (Splat) {
+            if (Splat.getOpcode() == ISD::ZERO_EXTEND &&
+                Splat.getOperand(0).getValueType().getScalarSizeInBits() == N)
+              return Splat.getOperand(0);
+            if (Splat.getOpcode() == ISD::AND) {
+              SDValue MaskOp = Splat.getOperand(1);
+              if (auto *CN = dyn_cast<ConstantSDNode>(MaskOp.getNode())) {
+                unsigned WideBits = Splat.getValueType().getScalarSizeInBits();
+                if (CN->getAPIntValue() == APInt::getLowBitsSet(WideBits, N)) {
+                  SDValue AndSrc = Splat.getOperand(0);
+                  if ((AndSrc.getOpcode() == ISD::ANY_EXTEND ||
+                       AndSrc.getOpcode() == ISD::ZERO_EXTEND) &&
+                      AndSrc.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                    return AndSrc.getOperand(0);
+                }
+              }
+            }
+          }
+        }
+      }
+      if (X.getOpcode() == ISD::INSERT_VECTOR_ELT) {
+        SDValue Scalar = X.getOperand(1);
+        if (Scalar.getOpcode() == ISD::ZERO_EXTEND &&
+            Scalar.getOperand(0).getValueType().getScalarSizeInBits() == N)
+          return Scalar.getOperand(0);
+        if (Scalar.getOpcode() == ISD::AND) {
+          SDValue MaskOp = Scalar.getOperand(1);
+          if (auto *CN = dyn_cast<ConstantSDNode>(MaskOp.getNode())) {
+            unsigned WideBits = Scalar.getValueType().getScalarSizeInBits();
+            if (CN->getAPIntValue() == APInt::getLowBitsSet(WideBits, N)) {
+              SDValue AndSrc = Scalar.getOperand(0);
+              if ((AndSrc.getOpcode() == ISD::ANY_EXTEND ||
+                   AndSrc.getOpcode() == ISD::ZERO_EXTEND) &&
+                  AndSrc.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                return AndSrc.getOperand(0);
+            }
+          }
+        }
+      }
+      if (X.getOpcode() == ISD::SCALAR_TO_VECTOR) {
+        SDValue Scalar = X.getOperand(0);
+        if (Scalar.getOpcode() == ISD::ZERO_EXTEND &&
+            Scalar.getOperand(0).getValueType().getScalarSizeInBits() == N)
+          return Scalar.getOperand(0);
+      }
+      return SDValue();
+    };
+    auto IsZExtOfHalfVT = [&](SDValue V, SDValue &Src) -> bool {
+      if (SDValue R = CheckZext(V)) { Src = R; return true; }
+      if (V.getOpcode() == ISD::SPLAT_VECTOR) {
+        if (SDValue R = CheckZext(V.getOperand(0))) { Src = R; return true; }
+      }
+      if (V.getOpcode() == ISD::BUILD_VECTOR) {
+        if (auto *BV = dyn_cast<BuildVectorSDNode>(V.getNode())) {
+          SDValue Splat = BV->getSplatValue();
+          if (Splat) {
+            if (SDValue R = CheckZext(Splat)) { Src = R; return true; }
+          }
+        }
+      }
+      if (V.getOpcode() == ISD::VECTOR_SHUFFLE) {
+        auto *SVN = cast<ShuffleVectorSDNode>(V.getNode());
+        ArrayRef<int> Mask = SVN->getMask();
+        if (!Mask.empty() && Mask[0] >= 0) {
+          bool isSplat = true;
+          for (int M : Mask)
+            if (M != Mask[0]) { isSplat = false; break; }
+          if (isSplat) {
+            unsigned NumElts = V.getValueType().getVectorNumElements();
+            SDValue SplatSrc = (unsigned)Mask[0] < NumElts
+                ? V.getOperand(0) : V.getOperand(1);
+            if (SDValue R = CheckZext(SplatSrc)) { Src = R; return true; }
+          }
+        }
+      }
+      return false;
+    };
+    SDValue A, B;
+    if (IsZExtOfHalfVT(N0.getOperand(0), A) &&
+        IsZExtOfHalfVT(N0.getOperand(1), B)) {
+      EVT HalfVT = A.getValueType();
+      if (HalfVT.getScalarSizeInBits() == N) {
+        if (A.getValueType() != HalfVT)
+          A = DAG.getNode(ISD::SPLAT_VECTOR, DL, HalfVT, A);
+        if (B.getValueType() != HalfVT)
+          B = DAG.getNode(ISD::SPLAT_VECTOR, DL, HalfVT, B);
+        SDValue MulHu = DAG.getNode(ISD::MULHU, DL, HalfVT, A, B);
+        if (HalfVT == VT)
+          return MulHu;
+        // Need wrapping: only handle when type matches to avoid crashes
+        // visitTRUNCATE handles the trunc(srl(mul,...)) case directly
+      }
+     }
+    }
+  }
+
   // fold (srl (srl x, c1), c2) -> 0 or (srl x, (add c1, c2))
   if (N0.getOpcode() == ISD::SRL) {
     auto MatchOutOfRange = [OpSizeInBits](ConstantSDNode *LHS,
@@ -17547,6 +17686,136 @@ SDValue DAGCombiner::visitTRUNCATE(SDNode *N) {
   // fold (truncate c1) -> c1
   if (SDValue C = DAG.FoldConstantArithmetic(ISD::TRUNCATE, DL, VT, {N0}))
     return C;
+
+  // Combine: trunc(srl(mul(zext(a), zext(b)), SrcSize/2)) -> mulhu(a, b)
+  // Handles zext, AND(zext->AND), splat-of-zext (BUILD_VECTOR, VECTOR_SHUFFLE,
+  // INSERT_VECTOR_ELT, SCALAR_TO_VECTOR).
+  if (N0.getOpcode() == ISD::SRL && SrcVT.getScalarSizeInBits() >= 64 &&
+      VT.getScalarSizeInBits() * 2 == SrcVT.getScalarSizeInBits()) {
+    SDValue SrlAmt = N0.getOperand(1);
+    if (ConstantSDNode *SrlC = isConstOrConstSplat(SrlAmt)) {
+      if (SrlC->getAPIntValue() == SrcVT.getScalarSizeInBits() / 2) {
+        SDValue Mul = N0.getOperand(0);
+        if (Mul.getOpcode() == ISD::MUL && Mul.hasOneUse()) {
+          unsigned N = VT.getScalarSizeInBits();
+          auto CheckZext = [&](SDValue X) -> SDValue {
+            if (X.getOpcode() == ISD::ZERO_EXTEND &&
+                X.getOperand(0).getValueType().getScalarSizeInBits() == N)
+              return X.getOperand(0);
+            if (X.getOpcode() == ISD::AND) {
+              SDValue MaskOp = X.getOperand(1);
+              APInt Mask;
+              if (auto *CN = dyn_cast<ConstantSDNode>(MaskOp.getNode()))
+                Mask = CN->getAPIntValue();
+              else if (auto *BV = dyn_cast<BuildVectorSDNode>(MaskOp.getNode())) {
+                SDValue S = BV->getSplatValue();
+                if (S && isa<ConstantSDNode>(S.getNode()))
+                  Mask = cast<ConstantSDNode>(S.getNode())->getAPIntValue();
+              }
+              unsigned WideBits = X.getValueType().getScalarSizeInBits();
+              if (Mask.getBitWidth() > 0 &&
+                  Mask == APInt::getLowBitsSet(WideBits, N)) {
+                SDValue AndSrc = X.getOperand(0);
+                if ((AndSrc.getOpcode() == ISD::ANY_EXTEND ||
+                     AndSrc.getOpcode() == ISD::ZERO_EXTEND ||
+                     AndSrc.getOpcode() == ISD::SIGN_EXTEND) &&
+                    AndSrc.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                  return AndSrc.getOperand(0);
+              }
+            }
+            if (X.getOpcode() == ISD::BUILD_VECTOR) {
+              if (auto *BV = dyn_cast<BuildVectorSDNode>(X.getNode())) {
+                SDValue Splat = BV->getSplatValue();
+                if (Splat) {
+                  if (Splat.getOpcode() == ISD::ZERO_EXTEND &&
+                      Splat.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                    return Splat.getOperand(0);
+                  if (Splat.getOpcode() == ISD::AND) {
+                    SDValue MaskOp = Splat.getOperand(1);
+                    if (auto *CN = dyn_cast<ConstantSDNode>(MaskOp.getNode())) {
+                      unsigned WideBits = Splat.getValueType().getScalarSizeInBits();
+                      if (CN->getAPIntValue() == APInt::getLowBitsSet(WideBits, N)) {
+                        SDValue AndSrc = Splat.getOperand(0);
+                        if ((AndSrc.getOpcode() == ISD::ANY_EXTEND ||
+                             AndSrc.getOpcode() == ISD::ZERO_EXTEND) &&
+                            AndSrc.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                          return AndSrc.getOperand(0);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (X.getOpcode() == ISD::INSERT_VECTOR_ELT) {
+              SDValue Scalar = X.getOperand(1);
+              if (Scalar.getOpcode() == ISD::ZERO_EXTEND &&
+                  Scalar.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                return Scalar.getOperand(0);
+              if (Scalar.getOpcode() == ISD::AND) {
+                SDValue MaskOp = Scalar.getOperand(1);
+                if (auto *CN = dyn_cast<ConstantSDNode>(MaskOp.getNode())) {
+                  unsigned WideBits = Scalar.getValueType().getScalarSizeInBits();
+                  if (CN->getAPIntValue() == APInt::getLowBitsSet(WideBits, N)) {
+                    SDValue AndSrc = Scalar.getOperand(0);
+                    if ((AndSrc.getOpcode() == ISD::ANY_EXTEND ||
+                         AndSrc.getOpcode() == ISD::ZERO_EXTEND) &&
+                        AndSrc.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                      return AndSrc.getOperand(0);
+                  }
+                }
+              }
+            }
+            if (X.getOpcode() == ISD::SCALAR_TO_VECTOR) {
+              SDValue Scalar = X.getOperand(0);
+              if (Scalar.getOpcode() == ISD::ZERO_EXTEND &&
+                  Scalar.getOperand(0).getValueType().getScalarSizeInBits() == N)
+                return Scalar.getOperand(0);
+            }
+            return SDValue();
+          };
+          auto IsZExtOfVT = [&](SDValue V, SDValue &Src) -> bool {
+            if (SDValue R = CheckZext(V)) { Src = R; return true; }
+            if (V.getOpcode() == ISD::SPLAT_VECTOR) {
+              if (SDValue R = CheckZext(V.getOperand(0))) { Src = R; return true; }
+            }
+            if (V.getOpcode() == ISD::BUILD_VECTOR) {
+              if (auto *BV = dyn_cast<BuildVectorSDNode>(V.getNode())) {
+                SDValue Splat = BV->getSplatValue();
+                if (Splat) {
+                  if (SDValue R = CheckZext(Splat)) { Src = R; return true; }
+                }
+              }
+            }
+            if (V.getOpcode() == ISD::VECTOR_SHUFFLE) {
+              auto *SVN = cast<ShuffleVectorSDNode>(V.getNode());
+              ArrayRef<int> Mask = SVN->getMask();
+              if (!Mask.empty() && Mask[0] >= 0) {
+                bool isSplat = true;
+                for (int M : Mask)
+                  if (M != Mask[0]) { isSplat = false; break; }
+                if (isSplat) {
+                  unsigned NumElts = V.getValueType().getVectorNumElements();
+                  SDValue SplatSrc = (unsigned)Mask[0] < NumElts
+                      ? V.getOperand(0) : V.getOperand(1);
+                  if (SDValue R = CheckZext(SplatSrc)) { Src = R; return true; }
+                }
+              }
+            }
+            return false;
+          };
+          SDValue A, B;
+          if (IsZExtOfVT(Mul.getOperand(0), A) &&
+              IsZExtOfVT(Mul.getOperand(1), B)) {
+            if (A.getValueType() != VT)
+              A = DAG.getNode(ISD::SPLAT_VECTOR, DL, VT, A);
+            if (B.getValueType() != VT)
+              B = DAG.getNode(ISD::SPLAT_VECTOR, DL, VT, B);
+            return DAG.getNode(ISD::MULHU, DL, VT, A, B);
+          }
+        }
+      }
+    }
+  }
 
   // fold (truncate (ext x)) -> (ext x) or (truncate x) or x
   if (N0.getOpcode() == ISD::ZERO_EXTEND ||
