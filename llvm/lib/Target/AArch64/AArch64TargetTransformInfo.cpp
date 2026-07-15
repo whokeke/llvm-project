@@ -38,6 +38,16 @@ using namespace llvm::PatternMatch;
 static cl::opt<bool> EnableFalkorHWPFUnrollFix("enable-falkor-hwpf-unroll-fix",
                                                cl::init(true), cl::Hidden);
 
+// [enhancement] Gate the SVE2 high-multiply-extract vectorization: when on,
+// the loop vectorizer forms scalable <N x i128> mul+lshr for the high-mul
+// idiom (e.g. SEAL Shoup multiply_uint_mod_lazy), which the backend
+// combineShiftToMULH then lowers to umulh z.d. When off, the vectorizer
+// bails (original scalar behavior).
+static cl::opt<bool> SVEMulI128HighExtractVec(
+    "aarch64-sve-mul-i128-high-extract-vec", cl::init(true), cl::Hidden,
+    cl::desc("Enable SVE2 vectorization of mul i128 high-extract loops "
+             "(Shoup/NTT high-multiply). Default on."));
+
 static cl::opt<bool> SVEPreferFixedOverScalableIfEqualCost(
     "sve-prefer-fixed-over-scalable-if-equal", cl::Hidden);
 
@@ -3555,6 +3565,18 @@ bool AArch64TTIImpl::isSingleExtWideningInstruction(
                            cast<VectorType>(DstTy)->getElementCount());
   };
 
+  // [enhancement] SVE i128 widening mul (both-zext) -> true; else false.
+  if (SVEMulI128HighExtractVec && Opcode == Instruction::Mul &&
+      ST->hasSVE() && isa<ScalableVectorType>(DstTy) &&
+      DstTy->getScalarSizeInBits() == 128 && Args.size() == 2) {
+    auto IsZExtI64 = [](const Value *V) {
+      const auto *Z = dyn_cast<ZExtInst>(V);
+      return Z && Z->getOperand(0)->getType()->getScalarSizeInBits() == 64;
+    };
+    if (IsZExtI64(Args[0]) && IsZExtI64(Args[1])) return true;
+    return false;
+  }
+
   // Exit early if DstTy is not a vector type whose elements are one of [i16,
   // i32, i64]. SVE doesn't generally have the same set of instructions to
   // perform an extend with the add/sub/mul. There are SMULLB style
@@ -3740,6 +3762,18 @@ InstructionCost AArch64TTIImpl::getCastInstrCost(unsigned Opcode, Type *Dst,
                                                  const Instruction *I) const {
   int ISD = TLI->InstructionOpcodeToISD(Opcode);
   assert(ISD && "Invalid opcode");
+  // [enhancement] high/low-mul-extract idiom trunc -> 0; non-idiom i128->64 -> 1024
+  if (SVEMulI128HighExtractVec && I && Opcode == Instruction::Trunc &&
+      Dst->getScalarSizeInBits() == 64 &&
+      Src->getScalarSizeInBits() == 128) {
+    Value *X = nullptr, *Y = nullptr;
+    bool M = match(I, m_Trunc(m_LShr(m_Mul(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y))),
+                                     m_SpecificInt(64))));
+    if (!M) { X = nullptr; Y = nullptr;
+      M = match(I, m_Trunc(m_Mul(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y))))); }
+    if (M && X->getType()->getScalarSizeInBits() == 64) return 0;
+    if (ST->hasSVE() && Src->isVectorTy()) return InstructionCost(1024);
+  }
   // If the cast is observable, and it is used by a widening instruction (e.g.,
   // uaddl, saddw, etc.), it may be free.
   if (I && I->hasOneUser()) {
@@ -3783,6 +3817,21 @@ InstructionCost AArch64TTIImpl::getCastInstrCost(unsigned Opcode, Type *Dst,
         isExtPartOfAvgExpr(SingleUser, Dst, Src))
       return 0;
   }
+
+  // [enhancement] non-clean zext/sext i64->i128 (vector) -> 1024 (bail; clean
+  // case was free above). Prevents forming unlowerable i128 zexts.
+  if (SVEMulI128HighExtractVec && I && ST->hasSVE() &&
+      (Opcode == Instruction::ZExt || Opcode == Instruction::SExt) &&
+      I->getType()->isVectorTy() && Dst->getScalarSizeInBits() == 128 &&
+      Src->getScalarSizeInBits() == 64)
+    return InstructionCost(1024);
+
+  // TODO: Allow non-throughput costs that aren't binary.
+  auto AdjustCost = [&CostKind](InstructionCost Cost) -> InstructionCost {
+    if (CostKind != TTI::TCK_RecipThroughput)
+      return Cost == 0 ? 0 : 1;
+    return Cost;
+  };
 
   EVT SrcTy = TLI->getValueType(DL, Src);
   EVT DstTy = TLI->getValueType(DL, Dst);
@@ -5050,6 +5099,49 @@ InstructionCost AArch64TTIImpl::getArithmeticInstrCost(
     }
     return Cost;
   }
+  case ISD::MUL:
+    // When SVE is available, then we can lower the v2i64 operation using
+    // the SVE mul instruction, which has a lower cost.
+    if (LT.second == MVT::v2i64 && ST->hasSVE())
+      return LT.first;
+
+    // [enhancement] SVE i128 high-mul: clean both-zext high-only -> 1 (umumh z.d);
+    // non-clean i128 mul -> 1024 (bail; backend can't lower full-product i128).
+    if (SVEMulI128HighExtractVec && CxtI && ST->hasSVE() && Ty->isVectorTy() &&
+        Ty->getScalarSizeInBits() == 128) {
+      Value *X = nullptr, *Y = nullptr;
+      if (match(CxtI, m_Mul(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y)))) &&
+          X->getType()->getScalarSizeInBits() == 64) {
+        if (CxtI->hasOneUse() &&
+            match(*CxtI->user_begin(),
+                  m_LShr(m_Specific(CxtI), m_SpecificInt(64))))
+          return InstructionCost(1);
+        return InstructionCost(1024);
+      }
+    }
+
+    // When SVE is not available, there is no MUL.2d instruction,
+    // which means mul <2 x i64> is expensive as elements are extracted
+    // from the vectors and the muls scalarized.
+    // As getScalarizationOverhead is a bit too pessimistic, we
+    // estimate the cost for a i64 vector directly here, which is:
+    // - four 2-cost i64 extracts,
+    // - two 2-cost i64 inserts, and
+    // - two 1-cost muls.
+    // So, for a v2i64 with LT.First = 1 the cost is 14, and for a v4i64 with
+    // LT.first = 2 the cost is 28. If both operands are extensions it will not
+    // need to scalarize so the cost can be cheaper (smull or umull).
+    // so the cost can be cheaper (smull or umull).
+    if (LT.second != MVT::v2i64 || isWideningInstruction(Ty, Opcode, Args))
+      return LT.first;
+    return cast<VectorType>(Ty)->getElementCount().getKnownMinValue() *
+           (getArithmeticInstrCost(Opcode, Ty->getScalarType(), CostKind) +
+            getVectorInstrCost(Instruction::ExtractElement, Ty, CostKind, -1,
+                               nullptr, nullptr) *
+                2 +
+            getVectorInstrCost(Instruction::InsertElement, Ty, CostKind, -1,
+                               nullptr, nullptr));
+  case ISD::ADD:
   case ISD::XOR:
   case ISD::OR:
   case ISD::AND:
@@ -5059,6 +5151,24 @@ InstructionCost AArch64TTIImpl::getArithmeticInstrCost(
     // These nodes are marked as 'custom' for combining purposes only.
     // We know that they are legal. See LowerAdd in ISelLowering.
     return LT.first;
+  case ISD::SRL: {
+    // [enhancement] high-mul-extract idiom lshr(mul(zext,zext),half) -> 0
+    // (backend combineShiftToMULH folds to umulh z.d). Non-idiom i128 lshr
+    // -> 1024 (bail; avoid unlowerable scalable i128).
+    if (SVEMulI128HighExtractVec && CxtI && Ty->isVectorTy()) {
+      unsigned EltBits = Ty->getScalarSizeInBits();
+      if (EltBits >= 32 && (EltBits % 2) == 0) {
+        const unsigned Half = EltBits / 2;
+        Value *X = nullptr, *Y = nullptr;
+        if (match(CxtI, m_LShr(m_Mul(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y))),
+                               m_SpecificInt(Half))))
+          return 0;
+      }
+      if (EltBits == 128 && ST->hasSVE())
+        return InstructionCost(1024);
+    }
+    return LT.first;
+  }
 
   case ISD::FNEG:
     // Scalar fmul(fneg) or fneg(fmul) can be converted to fnmul
