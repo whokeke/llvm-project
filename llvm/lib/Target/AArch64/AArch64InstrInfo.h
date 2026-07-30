@@ -301,6 +301,16 @@ public:
   /// responsible for ensuring the opc has a flag setting equivalent.
   static unsigned convertToFlagSettingOpc(unsigned Opc);
 
+  /// Return true if all memory operands of \p MI are safe to pair into LDP/STP.
+  /// Volatile and ordered atomics (acquire/release/seqcst) are rejected.
+  /// Non-atomic and unordered accesses are unconditionally allowed, matching
+  /// the previous hasOrderedMemoryRef() behavior. Monotonic (relaxed) atomics
+  /// are allowed when -aarch64-atomic-relaxed-pairing is enabled (default),
+  /// since on AArch64 a monotonic load/store is a plain ldr/str and LDP/STP
+  /// preserves per-access atomicity (Arm ARM B2.2.1). An empty memoperand
+  /// list is conservatively rejected.
+  static bool isSafeToPairMemRef(const MachineInstr &MI);
+
   /// Return true if this is a load/store that can be potentially paired/merged.
   bool isCandidateToMergeOrPair(const MachineInstr &MI) const;
 

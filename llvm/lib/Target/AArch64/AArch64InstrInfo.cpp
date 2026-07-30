@@ -103,6 +103,11 @@ static cl::opt<unsigned> GatherOptSearchLimit(
     cl::desc("Restrict range of instructions to search for the "
              "machine-combiner gather pattern optimization"));
 
+static cl::opt<bool> EnableAtomicRelaxedPairing(
+    "aarch64-atomic-relaxed-pairing", cl::init(true), cl::Hidden,
+    cl::desc("Allow relaxed (monotonic) atomic loads/stores to pair into "
+             "LDP/STP"));
+
 AArch64InstrInfo::AArch64InstrInfo(const AArch64Subtarget &STI)
     : AArch64GenInstrInfo(STI, RI, AArch64::ADJCALLSTACKDOWN,
                           AArch64::ADJCALLSTACKUP, AArch64::CATCHRET),
@@ -3516,14 +3521,30 @@ unsigned AArch64InstrInfo::convertToFlagSettingOpc(unsigned Opc) {
   }
 }
 
+bool AArch64InstrInfo::isSafeToPairMemRef(const MachineInstr &MI) {
+  if (MI.memoperands_empty())
+    return false;
+  for (const MachineMemOperand *MMO : MI.memoperands()) {
+    if (MMO->isVolatile())
+      return false;
+    AtomicOrdering Ord = MMO->getSuccessOrdering();
+    if (Ord == AtomicOrdering::NotAtomic || Ord == AtomicOrdering::Unordered)
+      continue;
+    if (EnableAtomicRelaxedPairing && Ord == AtomicOrdering::Monotonic)
+      continue;
+    return false;
+  }
+  return true;
+}
+
 // Is this a candidate for ld/st merging or pairing?  For example, we don't
 // touch volatiles or load/stores that have a hint to avoid pair formation.
 bool AArch64InstrInfo::isCandidateToMergeOrPair(const MachineInstr &MI) const {
 
   bool IsPreLdSt = isPreLdSt(MI);
 
-  // If this is a volatile load/store, don't mess with it.
-  if (MI.hasOrderedMemoryRef())
+  // If this is a volatile or ordered atomic load/store, don't mess with it.
+  if (!isSafeToPairMemRef(MI))
     return false;
 
   // Make sure this is a reg/fi+imm (as opposed to an address reloc).

@@ -52,7 +52,7 @@ define i64 @test_simple_atomic() {
 ; CHECK-NEXT:  .text
 entry:
   %0 = load atomic i64, ptr @foo monotonic, align 8, !pcsections !0
-  %1 = load i64, ptr @bar, align 8
+  %1 = load volatile i64, ptr @bar, align 8
   %add = add nsw i64 %1, %0
   ret i64 %add
 }
