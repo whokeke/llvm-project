@@ -173,8 +173,8 @@ bool AArch64LoopDeunrollImpl::tryRerollLoop(Loop *L) {
     return false;
 
   // 2. Back-branch + guard icmp.
-  auto *Br = dyn_cast<BranchInst>(Header->getTerminator());
-  if (!Br || !Br->isConditional())
+  auto *Br = dyn_cast<CondBrInst>(Header->getTerminator());
+  if (!Br)
     return false;
   if (Br->getSuccessor(0) != Header && Br->getSuccessor(1) != Header)
     return false;

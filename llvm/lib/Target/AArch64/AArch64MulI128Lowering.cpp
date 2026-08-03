@@ -119,7 +119,7 @@ static bool processCandidate(Function &F, Instruction *MulI) {
   Value *LowHalf = B.CreateMul(X, Y, /*Name=*/"", /*HasNUW=*/false,
                                /*HasNSW=*/false);
   Function *UMulFix =
-      Intrinsic::getDeclaration(F.getParent(), Intrinsic::umul_fix, {I64Ty});
+      Intrinsic::getOrInsertDeclaration(F.getParent(), Intrinsic::umul_fix, {I64Ty});
   // @llvm.umul.fix.i64 has signature (i64, i64, i32 scale). The scale is the
   // fixed-point shift applied to the 128-bit product; scale=64 returns the
   // high 64 bits (umulh). Use i32 for the scale argument.
