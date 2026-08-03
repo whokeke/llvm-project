@@ -75,6 +75,7 @@ add_llvm_target(AArch64CodeGen
   AArch64MCInstLower.cpp
   AArch64PerfectShuffle.cpp
   AArch64MulI128Lowering.cpp
+  AArch64LoopDeunroll.cpp
   AArch64PointerAuth.cpp
   AArch64PostCoalescerPass.cpp
   AArch64PromoteConstant.cpp

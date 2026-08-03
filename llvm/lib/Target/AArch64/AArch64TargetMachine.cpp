@@ -15,6 +15,7 @@
 #include "AArch64MachineScheduler.h"
 #include "AArch64MacroFusion.h"
 #include "AArch64MulI128Lowering.h"
+#include "AArch64LoopDeunroll.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -281,6 +282,7 @@ LLVMInitializeAArch64Target() {
   initializeAArch64StackTaggingPreRALegacyPass(PR);
   initializeAArch64LowerHomogeneousPrologEpilogLegacyPass(PR);
   initializeAArch64MulI128LoweringPass(PR);
+  initializeAArch64LoopDeunrollPass(PR);
   initializeAArch64DAGToDAGISelLegacyPass(PR);
   initializeAArch64CondBrTuningPass(PR);
   initializeAArch64Arm64ECCallLoweringPass(PR);
@@ -627,6 +629,7 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
           ThinOrFullLTOPhase Phase) {
         FunctionPassManager FPM;
         FPM.addPass(AArch64MulI128LoweringPass());
+        FPM.addPass(AArch64LoopDeunrollPass());
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       });
 
@@ -699,6 +702,10 @@ void AArch64PassConfig::addIRPasses() {
   // [enhancement] IR pass: mul i128 -> mul i64 + @llvm.umul.fix
   if (TM->getOptLevel() != CodeGenOptLevel::None)
     addPass(createAArch64MulI128LoweringPass());
+
+  // [enhancement] IR pass: reroll manual N-x unrolled loops to single-iter
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAArch64LoopDeunrollPass());
 
   TargetPassConfig::addIRPasses();
 
