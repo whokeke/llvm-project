@@ -2180,6 +2180,8 @@ void VPWidenCallRecipe::execute(VPTransformState &State) {
 
 InstructionCost VPWidenCallRecipe::computeCost(ElementCount VF,
                                                VPCostContext &Ctx) const {
+  if (!Variant)
+    return InstructionCost(100000);
   assert(getVectorizedTypeVF(Variant->getReturnType()) == VF &&
          "Variant return type must match VF");
   return computeCallCost(Variant, Ctx);

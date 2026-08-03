@@ -11798,7 +11798,12 @@ SDValue DAGCombiner::visitSRL(SDNode *N) {
     if (IsZExtOfHalfVT(N0.getOperand(0), A) &&
         IsZExtOfHalfVT(N0.getOperand(1), B)) {
       EVT HalfVT = A.getValueType();
-      if (HalfVT.getScalarSizeInBits() == N) {
+      if (HalfVT.getScalarSizeInBits() == N &&
+          // Skip when MULHU on HalfVT would be Expanded (e.g. AArch64
+          // scalar i32/i64). Otherwise Legalize re-materializes the
+          // srl(mul(zext,zext)) pattern, which re-triggers this combine
+          // and causes a combine-legalize infinite loop.
+          TLI.isOperationLegalOrCustom(ISD::MULHU, HalfVT)) {
         if (A.getValueType() != HalfVT)
           A = DAG.getNode(ISD::SPLAT_VECTOR, DL, HalfVT, A);
         if (B.getValueType() != HalfVT)
@@ -17805,7 +17810,11 @@ SDValue DAGCombiner::visitTRUNCATE(SDNode *N) {
           };
           SDValue A, B;
           if (IsZExtOfVT(Mul.getOperand(0), A) &&
-              IsZExtOfVT(Mul.getOperand(1), B)) {
+              IsZExtOfVT(Mul.getOperand(1), B) &&
+              // Same rationale as in visitSRL: skip when MULHU on VT
+              // would be Expanded (e.g. AArch64 scalar i32/i64) to avoid
+              // a combine-legalize infinite loop.
+              TLI.isOperationLegalOrCustom(ISD::MULHU, VT)) {
             if (A.getValueType() != VT)
               A = DAG.getNode(ISD::SPLAT_VECTOR, DL, VT, A);
             if (B.getValueType() != VT)

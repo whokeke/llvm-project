@@ -14,6 +14,7 @@
 #include "AArch64MachineFunctionInfo.h"
 #include "AArch64MachineScheduler.h"
 #include "AArch64MacroFusion.h"
+#include "AArch64MulI128Lowering.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -279,6 +280,7 @@ LLVMInitializeAArch64Target() {
   initializeAArch64StackTaggingPass(PR);
   initializeAArch64StackTaggingPreRALegacyPass(PR);
   initializeAArch64LowerHomogeneousPrologEpilogLegacyPass(PR);
+  initializeAArch64MulI128LoweringPass(PR);
   initializeAArch64DAGToDAGISelLegacyPass(PR);
   initializeAArch64CondBrTuningPass(PR);
   initializeAArch64Arm64ECCallLoweringPass(PR);
@@ -619,6 +621,15 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
 #define GET_PASS_REGISTRY "AArch64PassRegistry.def"
 #include "llvm/Passes/TargetPassRegistry.inc"
 
+  // [enhancement] IR pass: mul i128 (zext,zext)+lshr+trunc -> mul i64 + @llvm.umul.fix
+  PB.registerOptimizerEarlyEPCallback(
+      [=](ModulePassManager &MPM, OptimizationLevel Level,
+          ThinOrFullLTOPhase Phase) {
+        FunctionPassManager FPM;
+        FPM.addPass(AArch64MulI128LoweringPass());
+        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+      });
+
   PB.registerLateLoopOptimizationsEPCallback(
       [=](LoopPassManager &LPM, OptimizationLevel Level) {
         if (Level != OptimizationLevel::O0)
@@ -684,6 +695,10 @@ void AArch64PassConfig::addIRPasses() {
     // invariant.
     addPass(createLICMPass());
   }
+
+  // [enhancement] IR pass: mul i128 -> mul i64 + @llvm.umul.fix
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAArch64MulI128LoweringPass());
 
   TargetPassConfig::addIRPasses();
 

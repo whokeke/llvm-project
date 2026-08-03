@@ -712,6 +712,29 @@ AArch64TTIImpl::getIntrinsicInstrCost(const IntrinsicCostAttributes &ICA,
     }
     break;
   }
+
+  // [enhancement] @llvm.umul.fix.i64(X, Y, 64) is the high-half of a 64x64->128
+  // multiply (umulh). On AArch64 with +v8.6a this is a single umulh scalar
+  // instruction; with +sve2 it is a single umulh z.d vector instruction.
+  // Return cost=1 so the loop vectorizer prefers the intrinsic form over
+  // scalarizing the call (which would be cost ~10*VF).
+  case Intrinsic::umul_fix:
+  case Intrinsic::smul_fix: {
+    // Only cheap when the scale equals the element width (high-half mul).
+    // @llvm.umul.fix.iN(X, Y, S) returns (X * Y) >> S where the product is
+    // 2N bits. S=N gives the high N bits (umulh). Other scales need extra
+    // shifts, so leave them to the default cost.
+    if (ICA.getArgs().size() >= 3) {
+      const auto *ScaleC = dyn_cast<ConstantInt>(ICA.getArgs()[2]);
+      unsigned EltBits = RetTy->getScalarSizeInBits();
+      if (ScaleC && ScaleC->equalsInt(EltBits) &&
+          (EltBits == 32 || EltBits == 64)) {
+        auto LT = getTypeLegalizationCost(RetTy);
+        return LT.first; // 1 umulh instruction per legalized part
+      }
+    }
+    break;
+  }
   case Intrinsic::umin:
   case Intrinsic::umax:
   case Intrinsic::smin:
@@ -3566,12 +3589,50 @@ bool AArch64TTIImpl::isSingleExtWideningInstruction(
   };
 
   // [enhancement] SVE i128 widening mul (both-zext) -> true; else false.
+  // Also recognize SEAL Barrett secondary-mul operands: `and (mul (zext,
+  // zext), low_64_mask)` and `lshr (mul (zext, zext), 64)` are semantically
+  // `zext i64 -> i128` (the low or high half of the 128-bit product, zero-
+  // extended back to 128 bits). Treating them as zext lets the loop
+  // vectorizer pack the secondary muls to <N x i128> just like the primary.
   if (SVEMulI128HighExtractVec && Opcode == Instruction::Mul &&
       ST->hasSVE() && isa<ScalableVectorType>(DstTy) &&
       DstTy->getScalarSizeInBits() == 128 && Args.size() == 2) {
     auto IsZExtI64 = [](const Value *V) {
-      const auto *Z = dyn_cast<ZExtInst>(V);
-      return Z && Z->getOperand(0)->getType()->getScalarSizeInBits() == 64;
+      // Direct zext i64 -> i128.
+      if (const auto *Z = dyn_cast<ZExtInst>(V))
+        return Z->getOperand(0)->getType()->getScalarSizeInBits() == 64;
+      // SEAL Barrett: `and (mul (zext i64, zext i64), low_64_mask)` == zext
+      // (trunc mul) == zext i64.
+      if (const auto *AI = dyn_cast<BinaryOperator>(V)) {
+        if (AI->getOpcode() == Instruction::And) {
+          using namespace llvm::PatternMatch;
+          const APInt *MaskC;
+          if (match(AI, m_And(m_Mul(m_Value(), m_Value()),
+                             m_APInt(MaskC)))) {
+            if (MaskC->getBitWidth() == 128 &&
+                MaskC->trunc(64).isAllOnes() &&
+                MaskC->lshr(64).trunc(64).isZero()) {
+              const Value *A = nullptr, *B = nullptr;
+              if (match(AI->getOperand(0),
+                        m_Mul(m_ZExt(m_Value(A)), m_ZExt(m_Value(B)))) ||
+                  match(AI->getOperand(1),
+                        m_Mul(m_ZExt(m_Value(A)), m_ZExt(m_Value(B)))))
+                return A && A->getType()->getScalarSizeInBits() == 64;
+            }
+          }
+        }
+        // SEAL Barrett: `lshr (mul (zext i64, zext i64), 64)` == zext (mulhu)
+        // == zext i64.
+        if (AI->getOpcode() == Instruction::LShr) {
+          using namespace llvm::PatternMatch;
+          const APInt *ShAmt;
+          if (match(AI, m_LShr(m_Mul(m_ZExt(m_Value()), m_ZExt(m_Value())),
+                               m_APInt(ShAmt))) &&
+              ShAmt->getBitWidth() == 128 && ShAmt->getZExtValue() == 64)
+            return true;
+        }
+      }
+      return false;
     };
     if (IsZExtI64(Args[0]) && IsZExtI64(Args[1])) return true;
     return false;
