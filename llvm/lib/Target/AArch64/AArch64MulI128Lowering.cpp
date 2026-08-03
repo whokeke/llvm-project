@@ -266,6 +266,8 @@ static bool processCandidate(Function &F, Instruction *MulI) {
   return true;
 }
 
+
+
 PreservedAnalyses
 AArch64MulI128LoweringImpl::run(Function &F, FunctionAnalysisManager &AM) {
   // The transform is only useful when SVE2 (umulh) is available; otherwise
@@ -312,11 +314,6 @@ AArch64MulI128LoweringImpl::run(Function &F, FunctionAnalysisManager &AM) {
 
   if (getenv("MULI128_DEBUG"))
     errs() << "\n=== AFTER " << F.getName() << " ===\n" << F;
-
-  // DCE sweep removed: it was incorrectly erasing instructions that were
-  // still needed, causing miscompilation (regex hang). Dead instructions
-  // (e.g. leftover zext-to-i128 operands) are cleaned up by the standard
-  // DCE/InstCombine passes that run later in the pipeline.
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
