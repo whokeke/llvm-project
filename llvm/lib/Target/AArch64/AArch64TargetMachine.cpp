@@ -16,6 +16,7 @@
 #include "AArch64MacroFusion.h"
 #include "AArch64MulI128Lowering.h"
 #include "AArch64LoopDeunroll.h"
+#include "AArch64StridedVectorize.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -633,10 +634,16 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       });
 
+  PB.registerVectorizerStartEPCallback(
+      [this](FunctionPassManager &FPM, OptimizationLevel Level) {
+        if (Level != OptimizationLevel::O0)
+          FPM.addPass(AArch64StridedVectorizePass());
+      });
   PB.registerLateLoopOptimizationsEPCallback(
       [=](LoopPassManager &LPM, OptimizationLevel Level) {
-        if (Level != OptimizationLevel::O0)
+        if (Level != OptimizationLevel::O0) {
           LPM.addPass(LoopIdiomVectorizePass());
+        }
       });
   if (getTargetTriple().isOSWindows())
     PB.registerPipelineEarlySimplificationEPCallback(
