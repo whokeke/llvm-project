@@ -78,6 +78,8 @@ add_llvm_target(AArch64CodeGen
   AArch64LoopDeunroll.cpp
   AArch64StridedVectorize.cpp
   AArch64DotProductReroll.cpp
+  AArch64LoopRerollPtrExit.cpp
+  AArch64GatherHoist.cpp
   AArch64PointerAuth.cpp
   AArch64PostCoalescerPass.cpp
   AArch64PromoteConstant.cpp

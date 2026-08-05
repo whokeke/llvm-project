@@ -18,6 +18,8 @@
 #include "AArch64LoopDeunroll.h"
 #include "AArch64StridedVectorize.h"
 #include "AArch64DotProductReroll.h"
+#include "AArch64LoopRerollPtrExit.h"
+#include "AArch64GatherHoist.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -633,18 +635,32 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         FPM.addPass(AArch64MulI128LoweringPass());
         FPM.addPass(AArch64LoopDeunrollPass());
         FPM.addPass(AArch64DotProductRerollPass());
+        // LoopRerollPtrExit runs at VectorizerStartEP (below) where loops
+        // are already in canonical form (after loop-rotate/loop-simplify).
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       });
 
   PB.registerVectorizerStartEPCallback(
       [this](FunctionPassManager &FPM, OptimizationLevel Level) {
-        if (Level != OptimizationLevel::O0)
+        if (Level != OptimizationLevel::O0) {
+          FPM.addPass(AArch64LoopRerollPtrExitPass());
           FPM.addPass(AArch64StridedVectorizePass());
+        }
       });
   PB.registerLateLoopOptimizationsEPCallback(
       [=](LoopPassManager &LPM, OptimizationLevel Level) {
         if (Level != OptimizationLevel::O0) {
           LPM.addPass(LoopIdiomVectorizePass());
+        }
+      });
+
+  PB.registerOptimizerLastEPCallback(
+      [](ModulePassManager &MPM, OptimizationLevel Level,
+         ThinOrFullLTOPhase Phase) {
+        if (Level != OptimizationLevel::O0) {
+          FunctionPassManager FPM;
+          FPM.addPass(AArch64GatherHoistPass());
+          MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
         }
       });
   if (getTargetTriple().isOSWindows())
