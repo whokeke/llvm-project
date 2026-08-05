@@ -515,14 +515,23 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
   // not fully match) never reach here, so their may-alias loads stay
   // protected by the AA check.
   if (AggressiveHoist) {
-    SmallVector<Value *, 4> Candidates{Operand, Modulus, HiArg0, HiArg1};
-    for (Value *V : Candidates) {
+    // Collect candidates into a SmallPtrSet first — Operand / Modulus /
+    // HiArg0 / HiArg1 may contain the SAME load (e.g. when the Barrett
+    // operand and the umul.fix quotient arg are the same SSA value).
+    // Without dedup, the first force-hoist erases the load, and the
+    // second iteration accesses freed memory → use-after-free crash in
+    // isLoopInvariant.
+    SmallPtrSet<LoadInst *, 4> HoistCandidates;
+    for (Value *V : {Operand, Modulus, HiArg0, HiArg1}) {
       auto *LD = dyn_cast<LoadInst>(V);
       if (!LD || isLoopInvariant(L, LD))
         continue;
       // Only force-hoist if the load's pointer is loop-invariant.
       if (!isLoopInvariant(L, LD->getPointerOperand()))
         continue;
+      HoistCandidates.insert(LD);
+    }
+    for (LoadInst *LD : HoistCandidates) {
       if (Debug)
         errs() << "STRIDED_VEC: force-hoist Barrett operand (bypass AA): "
                << *LD << "\n";
