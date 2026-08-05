@@ -16,9 +16,11 @@
 
 #include "AArch64.h"
 #include "AArch64StridedVectorize.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
-#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -41,6 +43,19 @@ static cl::opt<bool> EnableStridedVectorize(
     "aarch64-strided-vectorize",
     cl::init(false), cl::Hidden,
     cl::desc("Normalize Barrett-reduce strided-store loops for SVE auto-vectorization"));
+
+static cl::opt<bool> AggressiveHoist(
+    "aarch64-strided-vectorize-aggressive-hoist",
+    cl::init(false), cl::Hidden,
+    cl::desc("Skip the may-alias safety check when hoisting loop-invariant "
+             "loads. Unsafe in general (the loop body may store to the same "
+             "memory the load reads, and hoisting would lose the update), "
+             "but enables scatter generation for loops where AA is "
+             "conservative (e.g. SEAL fast_convert_array: heap-allocated "
+             "temp buffer vs ibase_ function argument share no alias.scope/"
+             "noalias metadata, so BasicAA returns MayAlias even though "
+             "the buffers are distinct). Use only when the user has verified "
+             "the load/store do not actually alias in their target workload."));
 
 namespace {
 
@@ -224,22 +239,28 @@ static bool detectPattern(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
 }
 
 static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
-                          const DataLayout &DL) {
+                          AAResults &AA, const DataLayout &DL) {
   BasicBlock *Header = L->getHeader();
   BasicBlock *Preheader = L->getLoopPreheader();
   BasicBlock *Latch = L->getLoopLatch();
   bool Debug = getenv("STRIDED_VEC_DEBUG") != nullptr;
   bool Changed = false;
 
-  // 1. Hoist loop-invariant loads to the preheader
+  // 1. Hoist loop-invariant loads to the preheader.
   //    ONLY if all uses are inside the loop (otherwise replaceAllUsesWith
   //    would create use-before-def for uses in other blocks not dominated
-  //    by the preheader).
+  //    by the preheader). The load must be unordered (not volatile, not
+  //    atomic-ordered) and no instruction in the loop that may write to
+  //    memory may alias the load — otherwise hoisting is unsafe. This
+  //    mirrors the safety check in LLVM's standard LICM pass.
   SmallVector<LoadInst *, 8> ToHoist;
   for (BasicBlock *BB : L->blocks()) {
     for (Instruction &I : *BB) {
       auto *LD = dyn_cast<LoadInst>(&I);
       if (!LD)
+        continue;
+      // Skip volatile and atomic-ordered loads (must execute in order).
+      if (!LD->isUnordered())
         continue;
       Value *Ptr = LD->getPointerOperand();
       if (!isLoopInvariant(L, Ptr))
@@ -257,12 +278,54 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
       }
       if (!AllUsesInLoop)
         continue;
+      // Check that no may-write instruction in the loop aliases this load.
+      // This covers stores, atomicrmw, cmpxchg, va_arg, and calls that do
+      // not only-read-memory. Fence-like instructions (callbr/fence) lack
+      // a single MemoryLocation and conservatively block hoisting.
+      // AggressiveHoist bypasses this check for workloads where AA is
+      // conservative (e.g. SEAL fast_convert_array: heap alloc vs function
+      // argument without alias.scope/noalias pairing) — user responsibility.
+      bool MayAliasWrite = false;
+      if (!AggressiveHoist) {
+        for (BasicBlock *BB2 : L->blocks()) {
+          for (Instruction &J : *BB2) {
+            if (!J.mayWriteToMemory())
+              continue;
+            if (auto *CB = dyn_cast<CallBase>(&J)) {
+              if (!CB->onlyReadsMemory()) {
+                MayAliasWrite = true;
+                break;
+              }
+              continue;
+            }
+            std::optional<MemoryLocation> Loc = MemoryLocation::getOrNone(&J);
+            if (!Loc || !AA.isNoAlias(*Loc, MemoryLocation::get(LD))) {
+              MayAliasWrite = true;
+              break;
+            }
+          }
+          if (MayAliasWrite)
+            break;
+        }
+      }
+      if (MayAliasWrite) {
+        if (Debug)
+          errs() << "STRIDED_VEC: skip hoist (may-alias write) for " << *LD
+                 << "\n";
+        continue;
+      }
       ToHoist.push_back(LD);
     }
   }
   for (LoadInst *LD : ToHoist) {
     auto *NewLoad = cast<LoadInst>(LD->clone());
     NewLoad->insertBefore(Preheader->getTerminator());
+    // Scoped aliasing metadata is tied to the loop iteration; drop both
+    // halves of the (alias.scope, noalias) pair when hoisting out of the
+    // loop so downstream passes (auto-vectorizer) don't keep stale
+    // assumptions. Matches MemCpyOptimizer's handling.
+    NewLoad->setMetadata(LLVMContext::MD_alias_scope, nullptr);
+    NewLoad->setMetadata(LLVMContext::MD_noalias, nullptr);
     LD->replaceAllUsesWith(NewLoad);
     LD->eraseFromParent();
     Changed = true;
@@ -594,6 +657,7 @@ AArch64StridedVectorizePass::run(Function &F, FunctionAnalysisManager &AM) {
 
   auto &LI = AM.getResult<LoopAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  auto &AA = AM.getResult<AAManager>(F);
   const DataLayout &DL = F.getDataLayout();
 
   bool Debug = getenv("STRIDED_VEC_DEBUG") != nullptr;
@@ -623,7 +687,7 @@ AArch64StridedVectorizePass::run(Function &F, FunctionAnalysisManager &AM) {
   // Now process each match: hoisting + (if single-block) scatter
   bool DidScatter = false;
   for (auto &MI : Matches) {
-    Changed |= normalizeLoop(MI.L, MI.LI2, DT, DL);
+    Changed |= normalizeLoop(MI.L, MI.LI2, DT, AA, DL);
     // Only do scatter for ONE loop per function (to avoid stale LoopInfo)
     if (MI.IsSingleBlock && !DidScatter) {
       DidScatter = true;
