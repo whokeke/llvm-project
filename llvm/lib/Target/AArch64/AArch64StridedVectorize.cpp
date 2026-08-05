@@ -246,6 +246,12 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
   bool Debug = getenv("STRIDED_VEC_DEBUG") != nullptr;
   bool Changed = false;
 
+  // Phase 1: AA-checked hoist. All loops go through this safe path. Even
+  // with -aggressive-hoist, the bypass only fires later (Phase 2) for
+  // loops where the Barrett pattern fully matches AND we are about to
+  // generate a scatter — so non-matching loops like switch_key_inplace in
+  // SPEC 750 keep their may-alias loads protected.
+
   // 1. Hoist loop-invariant loads to the preheader.
   //    ONLY if all uses are inside the loop (otherwise replaceAllUsesWith
   //    would create use-before-def for uses in other blocks not dominated
@@ -282,31 +288,29 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
       // This covers stores, atomicrmw, cmpxchg, va_arg, and calls that do
       // not only-read-memory. Fence-like instructions (callbr/fence) lack
       // a single MemoryLocation and conservatively block hoisting.
-      // AggressiveHoist bypasses this check for workloads where AA is
-      // conservative (e.g. SEAL fast_convert_array: heap alloc vs function
-      // argument without alias.scope/noalias pairing) — user responsibility.
+      // (AggressiveHoist's force-hoist bypass happens later, only for
+      // Barrett operand loads in loops where scatter generation will
+      // actually fire — see Phase 2 below.)
       bool MayAliasWrite = false;
-      if (!AggressiveHoist) {
-        for (BasicBlock *BB2 : L->blocks()) {
-          for (Instruction &J : *BB2) {
-            if (!J.mayWriteToMemory())
-              continue;
-            if (auto *CB = dyn_cast<CallBase>(&J)) {
-              if (!CB->onlyReadsMemory()) {
-                MayAliasWrite = true;
-                break;
-              }
-              continue;
-            }
-            std::optional<MemoryLocation> Loc = MemoryLocation::getOrNone(&J);
-            if (!Loc || !AA.isNoAlias(*Loc, MemoryLocation::get(LD))) {
+      for (BasicBlock *BB2 : L->blocks()) {
+        for (Instruction &J : *BB2) {
+          if (!J.mayWriteToMemory())
+            continue;
+          if (auto *CB = dyn_cast<CallBase>(&J)) {
+            if (!CB->onlyReadsMemory()) {
               MayAliasWrite = true;
               break;
             }
+            continue;
           }
-          if (MayAliasWrite)
+          std::optional<MemoryLocation> Loc = MemoryLocation::getOrNone(&J);
+          if (!Loc || !AA.isNoAlias(*Loc, MemoryLocation::get(LD))) {
+            MayAliasWrite = true;
             break;
+          }
         }
+        if (MayAliasWrite)
+          break;
       }
       if (MayAliasWrite) {
         if (Debug)
@@ -497,6 +501,47 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
   auto *HiCall = cast<IntrinsicInst>(Hi);
   Value *HiArg0 = HiCall->getArgOperand(0);
   Value *HiArg1 = HiCall->getArgOperand(1);
+
+  // AggressiveHoist force-hoist: if any Barrett operand load is not
+  // loop-invariant (because the AA-safe Phase 1 hoist skipped it as
+  // may-alias), and AggressiveHoist is on, force-hoist these specific
+  // loads — bypassing the AA check. This is much narrower than a global
+  // bypass: it only fires for loops where the Barrett pattern fully
+  // matches (we have Operand / Modulus / Hi / Quotient candidates in
+  // hand) AND the load's pointer is provably loop-invariant (the load
+  // is loop-variant only because AA was conservative, not because the
+  // pointer truly varies). Other loops (e.g. switch_key_inplace in
+  // SPEC 750 — single-block + strided store but Barrett pattern does
+  // not fully match) never reach here, so their may-alias loads stay
+  // protected by the AA check.
+  if (AggressiveHoist) {
+    SmallVector<Value *, 4> Candidates{Operand, Modulus, HiArg0, HiArg1};
+    for (Value *V : Candidates) {
+      auto *LD = dyn_cast<LoadInst>(V);
+      if (!LD || isLoopInvariant(L, LD))
+        continue;
+      // Only force-hoist if the load's pointer is loop-invariant.
+      if (!isLoopInvariant(L, LD->getPointerOperand()))
+        continue;
+      if (Debug)
+        errs() << "STRIDED_VEC: force-hoist Barrett operand (bypass AA): "
+               << *LD << "\n";
+      auto *NewLoad = cast<LoadInst>(LD->clone());
+      NewLoad->insertBefore(Preheader->getTerminator());
+      NewLoad->setMetadata(LLVMContext::MD_alias_scope, nullptr);
+      NewLoad->setMetadata(LLVMContext::MD_noalias, nullptr);
+      LD->replaceAllUsesWith(NewLoad);
+      LD->eraseFromParent();
+      Changed = true;
+    }
+    // Re-extract after force-hoist (the Value* pointers above are stale).
+    Operand = (LoMul->getOperand(0) == InputLoad) ? LoMul->getOperand(1)
+                                                  : LoMul->getOperand(0);
+    HiCall = cast<IntrinsicInst>(Hi);
+    HiArg0 = HiCall->getArgOperand(0);
+    HiArg1 = HiCall->getArgOperand(1);
+  }
+
   bool Arg0Inv = isLoopInvariant(L, HiArg0);
   bool Arg1Inv = isLoopInvariant(L, HiArg1);
   if (!Arg0Inv && !Arg1Inv) {
@@ -516,7 +561,7 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
       !isLoopInvariant(L, Quotient)) {
     if (Debug)
       errs() << "STRIDED_VEC: scatter skip (Operand/Modulus/Quotient not "
-                "loop-invariant)\n";
+                 "loop-invariant)\n";
     return Changed;
   }
 
