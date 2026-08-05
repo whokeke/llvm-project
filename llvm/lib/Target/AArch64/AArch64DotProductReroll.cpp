@@ -134,29 +134,67 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   // Find the phi nodes in MergeBlock that collect acc_lo and acc_hi.
   // These are the phis with the most incoming values (one per case).
+  // We must correctly identify which is lo and which is hi — they are
+  // NOT in a fixed order. Check one case's incoming value: if it's a
+  // `mul` instruction, that phi is acc_lo; if it's an `@llvm.umul.fix`
+  // call, that phi is acc_hi.
   PHINode *AccLoPhi = nullptr;
   PHINode *AccHiPhi = nullptr;
   unsigned MaxIncoming = 0;
   for (PHINode &PN : MergeBlock->phis()) {
     if (PN.getNumIncomingValues() > MaxIncoming) {
       MaxIncoming = PN.getNumIncomingValues();
-      AccLoPhi = &PN;
     }
   }
-  if (!AccLoPhi) {
-    LLVM_DEBUG(dbgs() << "DPREROLL: no acc_lo phi in merge, skip\n");
-    return PreservedAnalyses::all();
-  }
-  // The other phi with same number of incoming values is acc_hi.
   for (PHINode &PN : MergeBlock->phis()) {
-    if (&PN != AccLoPhi &&
-        PN.getNumIncomingValues() == AccLoPhi->getNumIncomingValues()) {
-      AccHiPhi = &PN;
-      break;
+    if (PN.getNumIncomingValues() != MaxIncoming)
+      continue;
+    // Check one incoming value to determine lo vs hi.
+    for (unsigned i = 0; i < PN.getNumIncomingValues(); i++) {
+      Value *V = PN.getIncomingValue(i);
+      if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+        // @llvm.umul.fix → this phi is acc_hi
+        AccHiPhi = &PN;
+        break;
+      } else if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+        if (BO->getOpcode() == Instruction::Mul) {
+          // mul → this phi is acc_lo
+          AccLoPhi = &PN;
+          break;
+        }
+      }
     }
   }
-  if (!AccHiPhi) {
-    LLVM_DEBUG(dbgs() << "DPREROLL: no acc_hi phi in merge, skip\n");
+  // Fallback: if detection failed (e.g. incoming values are loads or
+  // other), assume first phi = acc_lo, second = acc_hi (may be wrong).
+  if (!AccLoPhi && !AccHiPhi) {
+    unsigned found = 0;
+    for (PHINode &PN : MergeBlock->phis()) {
+      if (PN.getNumIncomingValues() != MaxIncoming)
+        continue;
+      if (found == 0) AccLoPhi = &PN;
+      else AccHiPhi = &PN;
+      found++;
+    }
+  } else if (!AccLoPhi) {
+    // AccHiPhi found, the other one is AccLoPhi
+    for (PHINode &PN : MergeBlock->phis()) {
+      if (&PN != AccHiPhi && PN.getNumIncomingValues() == MaxIncoming) {
+        AccLoPhi = &PN;
+        break;
+      }
+    }
+  } else if (!AccHiPhi) {
+    // AccLoPhi found, the other one is AccHiPhi
+    for (PHINode &PN : MergeBlock->phis()) {
+      if (&PN != AccLoPhi && PN.getNumIncomingValues() == MaxIncoming) {
+        AccHiPhi = &PN;
+        break;
+      }
+    }
+  }
+  if (!AccLoPhi || !AccHiPhi) {
+    LLVM_DEBUG(dbgs() << "DPREROLL: could not identify acc_lo/acc_hi phi, skip\n");
     return PreservedAnalyses::all();
   }
 
@@ -268,12 +306,40 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   AccLoPhi->addIncoming(NewLo, AfterLoop);
   AccHiPhi->addIncoming(NewHi, AfterLoop);
 
-  // Modify entry block: replace switch with count==0 check.
-  Switch->eraseFromParent();
+  // Modify entry block: insert count check BEFORE the switch.
+  // count==0 or count > 16 → switch (original behavior, including
+  //   case 0 return + default tail recursion for count > 16).
+  // 1 ≤ count ≤ 16 → rerolled loop (vectorizable, no 128-bit overflow
+  //   because SEAL_MULTIPLY_ACCUMULATE_MOD_MAX = 16 guarantees
+  //   16 * (modulus-1)^2 < 2^128).
+  //
+  // Use splitBasicBlock to move the switch (and everything after it)
+  // to a new block, then replace entry's terminator with a condbr.
+  BasicBlock *SwitchBlock = Entry->splitBasicBlock(
+      Switch->getIterator(), "dpreroll.switch");
+  // Entry's terminator is now `br label %SwitchBlock`. Replace it.
+  Entry->getTerminator()->eraseFromParent();
   IRBuilder<> EB(Entry);
-  Value *CountIsZero = EB.CreateICmpEQ(Count, EB.getInt64(0),
-                                      "dpreroll.count_zero");
-  EB.CreateCondBr(CountIsZero, ReturnBlock, Preheader);
+  Value *CountLE16 = EB.CreateICmpULE(Count, EB.getInt64(16),
+                                      "dpreroll.count_le16");
+  Value *CountGT0 = EB.CreateICmpNE(Count, EB.getInt64(0),
+                                    "dpreroll.count_gt0");
+  Value *UseLoop = EB.CreateAnd(CountGT0, CountLE16,
+                                "dpreroll.use_loop");
+  EB.CreateCondBr(UseLoop, Preheader, SwitchBlock);
+
+  // Update phi nodes in blocks that had Entry as predecessor but now
+  // have SwitchBlock (because the switch moved there). The key one is
+  // ReturnBlock — case 0's phi has [count, Entry] which needs to
+  // become [count, SwitchBlock].
+  for (BasicBlock *BB : {ReturnBlock}) {
+    for (PHINode &PN : BB->phis()) {
+      for (unsigned i = 0; i < PN.getNumIncomingValues(); i++) {
+        if (PN.getIncomingBlock(i) == Entry)
+          PN.setIncomingBlock(i, SwitchBlock);
+      }
+    }
+  }
 
   LLVM_DEBUG(dbgs() << "DPREROLL: rerolled dot_product_mod into loop!\n");
 
