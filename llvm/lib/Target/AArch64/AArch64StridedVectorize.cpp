@@ -543,10 +543,27 @@ static bool normalizeLoop(Loop *L, LoopInfo2 &LI, DominatorTree &DT,
       LD->eraseFromParent();
       Changed = true;
     }
-    // Re-extract after force-hoist (the Value* pointers above are stale).
+    // Re-extract after force-hoist (Value* pointers above are stale).
+    // force-hoist only erases LoadInsts, so LoMul/ProdMul/SelInst/Hi
+    // themselves stay valid — but their operands got
+    // replaceAllUsesWith'd to the NewLoad in the preheader, so we must
+    // re-read the operands. Operand/HiArg0/HiArg1 are re-extracted
+    // below. Modulus MUST also be re-extracted from ProdMul + SelInst,
+    // otherwise the later CreateVectorSplat(Modulus) reads freed
+    // memory → wrong codegen → runtime miscompare.
     Operand = (LoMul->getOperand(0) == InputLoad) ? LoMul->getOperand(1)
                                                   : LoMul->getOperand(0);
     HiCall = cast<IntrinsicInst>(Hi);
+    if (ProdMul->getOperand(0) == HiCall)
+      Modulus = ProdMul->getOperand(1);
+    else
+      Modulus = ProdMul->getOperand(0);
+    // Re-apply the SelInst adjustment (SelInst's operands were also
+    // updated by RAUW, so the same true/false check still works).
+    if (SelInst->getTrueValue() == Modulus)
+      Modulus = SelInst->getFalseValue();
+    else if (SelInst->getFalseValue() != Modulus)
+      return Changed;
     HiArg0 = HiCall->getArgOperand(0);
     HiArg1 = HiCall->getArgOperand(1);
   }
