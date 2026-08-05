@@ -17,6 +17,7 @@
 #include "AArch64MulI128Lowering.h"
 #include "AArch64LoopDeunroll.h"
 #include "AArch64StridedVectorize.h"
+#include "AArch64DotProductReroll.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -631,6 +632,7 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         FunctionPassManager FPM;
         FPM.addPass(AArch64MulI128LoweringPass());
         FPM.addPass(AArch64LoopDeunrollPass());
+        FPM.addPass(AArch64DotProductRerollPass());
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       });
 
