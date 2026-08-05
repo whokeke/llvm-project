@@ -223,8 +223,24 @@ AArch64LoopRerollPtrExitPass::run(Function &F, FunctionAnalysisManager &AM) {
     if (!HasUmulFix)
       continue;
 
+    // Only reroll loops with step 8 (i64) or 16 (i128 pair).
+    // Larger steps (e.g. 48 = struct of 6 i64) indicate outer loops
+    // that should not be rerolled — rerolling them causes wrong trip
+    // count and correctness issues.
+    // We'll check this after analyzePtrExit returns the step.
+
     auto ExitInfo = analyzePtrExit(PtrCmp, L, DL);
     if (!ExitInfo) continue;
+
+    // Only reroll loops with step 8 (i64 element) or 16 (i128 pair).
+    // Larger steps indicate outer loops (e.g. step=48 = struct of 6 i64)
+    // that should not be rerolled.
+    if (ExitInfo->StepBytes != 8 && ExitInfo->StepBytes != 16) {
+      if (Debug)
+        errs() << "REROLL_PTR_EXIT: skip (step=" << ExitInfo->StepBytes
+               << " not 8/16) in " << F.getName() << "\n";
+      continue;
+    }
 
     if (Debug)
       errs() << "REROLL_PTR_EXIT: found ptr-based exit in "

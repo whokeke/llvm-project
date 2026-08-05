@@ -20,6 +20,7 @@
 #include "AArch64DotProductReroll.h"
 #include "AArch64LoopRerollPtrExit.h"
 #include "AArch64GatherHoist.h"
+#include "AArch64SwitchKeyVectorize.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -635,15 +636,17 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         FPM.addPass(AArch64MulI128LoweringPass());
         FPM.addPass(AArch64LoopDeunrollPass());
         FPM.addPass(AArch64DotProductRerollPass());
-        // LoopRerollPtrExit runs at VectorizerStartEP (below) where loops
-        // are already in canonical form (after loop-rotate/loop-simplify).
+        // SwitchKeyVectorize runs at VectorizerStartEP (below) where loops
+        // are already canonicalized by loop-simplify/loop-rotate.
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       });
 
   PB.registerVectorizerStartEPCallback(
       [this](FunctionPassManager &FPM, OptimizationLevel Level) {
         if (Level != OptimizationLevel::O0) {
+          FPM.addPass(AArch64SwitchKeyVectorizePass());
           FPM.addPass(AArch64LoopRerollPtrExitPass());
+          FPM.addPass(AArch64GatherHoistPass());
           FPM.addPass(AArch64StridedVectorizePass());
         }
       });
