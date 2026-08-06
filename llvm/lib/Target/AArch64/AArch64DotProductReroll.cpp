@@ -9,8 +9,11 @@
 /// Detects SEAL's `dot_product_mod` function (which uses a switch-case on
 /// `count` to dispatch to `multiply_accumulate_uint64<N>` template
 /// specializations — fully inlined as sequential mul + 128-bit add with
-/// carry) and replaces the switch with a single IV-based loop. This lets
-/// LoopVectorize vectorize it into SVE `mad + umulh z + cmphi + ld2d/st2d`.
+/// carry) and replaces the switch with a scalable SVE vector loop that
+/// does 128-bit carry propagation in-register (matching the ACLE SVE
+/// intrinsic version). The vector loop uses:
+///   whilelt + masked.load + mul_z + umulh_z + add_u + cmphi + zext + add_u
+/// followed by a short scalar horizontal reduction (N iterations).
 ///
 /// The pass runs at OptimizerEarlyEP (after MulI128Lowering, before
 /// LoopVectorize). Gated on `-aarch64-dot-product-reroll` (off by default).
@@ -22,6 +25,8 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsAArch64.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -201,130 +206,167 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   LLVM_DEBUG(dbgs() << "  acc_lo phi=" << *AccLoPhi << "\n"
                     << "  acc_hi phi=" << *AccHiPhi << "\n");
 
-  // --- Generate the loop ---
-  // Strategy: generate a vectorizable loop (mul + store, NO cross-iteration
-  // dependency) + a scalar horizontal sum loop after. LoopVectorize can
-  // vectorize the first loop (mul + store) into SVE mad + umulh z + ld1d/st1d.
-  // The scalar sum loop handles the 128-bit carry chain (count ≤ 16, cheap).
+  // --- Generate the SVE vector loop ---
+  // Instead of a scalar mul+store loop + scalar reduction (which relied on
+  // LoopVectorize to vectorize), we directly generate a scalable SVE vector
+  // loop with 128-bit carry propagation — matching the ACLE intrinsic
+  // version. This bypasses LoopVectorize (which can't recognize 128-bit carry
+  // reduction) and produces: mul z + umulh z + add z + cmphi + add z,p/m
+  // in the vector loop, with a short scalar horizontal reduction after.
   LLVMContext &Ctx = F.getContext();
   Type *I64Ty = Type::getInt64Ty(Ctx);
-  Function *UmulFixFn = Intrinsic::getOrInsertDeclaration(
-      F.getParent(), Intrinsic::umul_fix, {I64Ty});
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  auto *Nxv2I64 = VectorType::get(I64Ty, ElementCount::getScalable(2));
+  auto *Nxv2I1 = VectorType::get(I1Ty, ElementCount::getScalable(2));
 
-  // Alloc a temp array in entry for {lo, hi} pairs (max 64 elements).
-  // SEAL_MULTIPLY_ACCUMULATE_MOD_MAX = 16, but dot_product_mod handles
-  // count > 16 via tail recursion, so 64 is safe.
-  const unsigned MaxCount = 64;
+  // All-true predicate and zero vector for SVE ops.
+  Constant *AllTrue = ConstantVector::getSplat(
+      ElementCount::getScalable(2), ConstantInt::getTrue(I1Ty));
+  Constant *ZeroVec = Constant::getNullValue(Nxv2I64);
+
+  // Allocas for horizontal reduction storage (store acc_lo/acc_hi vectors).
+  const unsigned MaxVec = 8; // max svcntd() for up to 512-bit SVE
   IRBuilder<> EB0(Entry, Entry->getFirstInsertionPt());
-  Value *TempArr = EB0.CreateAlloca(
-      ArrayType::get(I64Ty, MaxCount * 2), nullptr, "dpreroll.temp");
+  AllocaInst *VecLoArr = EB0.CreateAlloca(
+      ArrayType::get(I64Ty, MaxVec), nullptr, "dpreroll.vec_lo");
+  AllocaInst *VecHiArr = EB0.CreateAlloca(
+      ArrayType::get(I64Ty, MaxVec), nullptr, "dpreroll.vec_hi");
+  VecLoArr->setAlignment(Align(16));
+  VecHiArr->setAlignment(Align(16));
 
   // Create blocks.
   BasicBlock *Preheader = BasicBlock::Create(Ctx, "dpreroll.ph", &F);
-  BasicBlock *LoopBody = BasicBlock::Create(Ctx, "dpreroll.loop", &F);
+  BasicBlock *VecLoop = BasicBlock::Create(Ctx, "dpreroll.vloop", &F);
+  BasicBlock *StoreBlock = BasicBlock::Create(Ctx, "dpreroll.store", &F);
   BasicBlock *SumPre = BasicBlock::Create(Ctx, "dpreroll.sumph", &F);
   BasicBlock *SumLoop = BasicBlock::Create(Ctx, "dpreroll.sumloop", &F);
   BasicBlock *AfterLoop = BasicBlock::Create(Ctx, "dpreroll.after", &F);
 
-  // Preheader: branch to loop body.
+  // Preheader: compute N = vscale * 2 (= svcntd()).
   IRBuilder<> PB(Preheader);
-  PB.CreateBr(LoopBody);
+  Value *Vscale = PB.CreateIntrinsic(Intrinsic::vscale, {I64Ty}, {}, {},
+                                     "dpreroll.vscale");
+  Value *N = PB.CreateMul(Vscale, PB.getInt64(2), "dpreroll.N");
+  PB.CreateBr(VecLoop);
 
-  // Loop body: IV phi (no acc phi — store to temp array, no reduction).
-  // This makes the loop vectorizable by LoopVectorize.
-  IRBuilder<> LB(LoopBody);
-  PHINode *IV = LB.CreatePHI(I64Ty, 2, "dpreroll.iv");
+  // VecLoop: scalable SVE vector loop with 128-bit carry propagation.
+  // Pattern (matching ACLE sve_add_u128):
+  //   pg = whilelt(IV, count)
+  //   v1 = masked_load(pg, op1+IV)
+  //   v2 = masked_load(pg, op2+IV)
+  //   prod_lo = mul_z(pg, v1, v2)
+  //   prod_hi = umulh_z(pg, v1, v2)
+  //   new_lo = add_x(acc_lo, prod_lo)        // unpredicated
+  //   carry = cmphi(acc_lo, new_lo)         // old > new = carry
+  //   carry_val = zext(carry) to nxv2i64    // 0 or 1
+  //   tmp_hi = add_x(acc_hi, prod_hi)       // unpredicated
+  //   new_hi = add_x(tmp_hi, carry_val)     // unpredicated
+  IRBuilder<> VL(VecLoop);
+  PHINode *IV = VL.CreatePHI(I64Ty, 2, "dpreroll.iv");
+  PHINode *AccLo = VL.CreatePHI(Nxv2I64, 2, "dpreroll.acc_lo");
+  PHINode *AccHi = VL.CreatePHI(Nxv2I64, 2, "dpreroll.acc_hi");
 
-  // Load op1[iv] and op2[iv].
-  Value *Op1Elem = LB.CreateGEP(I64Ty, Op1, IV, "dpreroll.op1_i");
-  Value *Op2Elem = LB.CreateGEP(I64Ty, Op2, IV, "dpreroll.op2_i");
-  Value *V1 = LB.CreateLoad(I64Ty, Op1Elem, "dpreroll.v1");
-  Value *V2 = LB.CreateLoad(I64Ty, Op2Elem, "dpreroll.v2");
+  // pg = whilelt(IV, count) via get_active_lane_mask
+  Value *PG = VL.CreateIntrinsic(
+      Intrinsic::get_active_lane_mask, {Nxv2I1, I64Ty},
+      {IV, Count}, {}, "dpreroll.pg");
 
-  // mul + umul.fix (64x64→128).
-  Value *Lo = LB.CreateMul(V2, V1, "dpreroll.lo");
-  Value *Hi = LB.CreateCall(UmulFixFn, {V2, V1, LB.getInt32(64)},
-                            "dpreroll.hi");
+  // v1 = masked_load(pg, op1+IV), v2 = masked_load(pg, op2+IV)
+  Value *Ptr1 = VL.CreateGEP(I64Ty, Op1, IV, "dpreroll.ptr1");
+  Value *Ptr2 = VL.CreateGEP(I64Ty, Op2, IV, "dpreroll.ptr2");
+  Value *V1 = VL.CreateMaskedLoad(Nxv2I64, Ptr1, Align(8), PG, ZeroVec,
+                                  "dpreroll.v1");
+  Value *V2 = VL.CreateMaskedLoad(Nxv2I64, Ptr2, Align(8), PG, ZeroVec,
+                                  "dpreroll.v2");
 
-  // Store {lo, hi} to temp array (stride 2: [iv*2] = lo, [iv*2+1] = hi).
-  Value *LoIdx = LB.CreateMul(IV, LB.getInt64(2), "dpreroll.lo_idx");
-  Value *HiIdx = LB.CreateAdd(LoIdx, LB.getInt64(1), "dpreroll.hi_idx");
-  Value *LoPtr = LB.CreateGEP(I64Ty, TempArr, LoIdx, "dpreroll.lo_ptr");
-  Value *HiPtr = LB.CreateGEP(I64Ty, TempArr, HiIdx, "dpreroll.hi_ptr");
-  LB.CreateStore(Lo, LoPtr);
-  LB.CreateStore(Hi, HiPtr);
+  // prod_lo = mul_z(pg, v1, v2), prod_hi = umulh_z(pg, v1, v2)
+  Value *ProdLo = VL.CreateIntrinsic(
+      Intrinsic::aarch64_sve_mul, {Nxv2I64}, {PG, V1, V2}, {},
+      "dpreroll.prod_lo");
+  Value *ProdHi = VL.CreateIntrinsic(
+      Intrinsic::aarch64_sve_umulh, {Nxv2I64}, {PG, V1, V2}, {},
+      "dpreroll.prod_hi");
 
-  // IV++ and loop condition.
-  Value *IVNext = LB.CreateAdd(IV, LB.getInt64(1), "dpreroll.iv_next");
-  Value *Cmp = LB.CreateICmpULT(IVNext, Count, "dpreroll.cmp");
-  LB.CreateCondBr(Cmp, LoopBody, SumPre);
+  // 128-bit add with carry (SVE predicate-based carry propagation):
+  Value *NewLo = VL.CreateIntrinsic(
+      Intrinsic::aarch64_sve_add_u, {Nxv2I64}, {AllTrue, AccLo, ProdLo}, {},
+      "dpreroll.new_lo");
+  Value *CarryPred = VL.CreateIntrinsic(
+      Intrinsic::aarch64_sve_cmphi, {Nxv2I64}, {AllTrue, AccLo, NewLo}, {},
+      "dpreroll.carry");
+  Value *CarryVal = VL.CreateZExt(CarryPred, Nxv2I64, "dpreroll.carry_val");
+  Value *TmpHi = VL.CreateIntrinsic(
+      Intrinsic::aarch64_sve_add_u, {Nxv2I64}, {AllTrue, AccHi, ProdHi}, {},
+      "dpreroll.tmp_hi");
+  Value *NewHi = VL.CreateIntrinsic(
+      Intrinsic::aarch64_sve_add_u, {Nxv2I64}, {AllTrue, TmpHi, CarryVal}, {},
+      "dpreroll.new_hi");
 
-  IV->addIncoming(LB.getInt64(0), Preheader);
-  IV->addIncoming(IVNext, LoopBody);
+  // IV += N, loop condition (do-while: always runs at least once).
+  Value *IVNext = VL.CreateAdd(IV, N, "dpreroll.iv_next");
+  Value *Cmp = VL.CreateICmpULT(IVNext, Count, "dpreroll.cmp");
+  VL.CreateCondBr(Cmp, VecLoop, StoreBlock);
 
-  // Sum preheader: load temp as contiguous <vscale x 4 x i64> vector
-  // (avoids gather — just a regular vector load). The temp array is
-  // [lo0, hi0, lo1, hi1, ...] (stride-2 interleaved). Loading
-  // <vscale x 4 x i64> gives VF*2 contiguous elements = VF pairs.
-  // Then use extractelement with computed indices to get lo/hi pairs
-  // in the scalar sum loop (no gather/scatter needed).
+  IV->addIncoming(PB.getInt64(0), Preheader);
+  IV->addIncoming(IVNext, VecLoop);
+  AccLo->addIncoming(ZeroVec, Preheader);
+  AccLo->addIncoming(NewLo, VecLoop);
+  AccHi->addIncoming(ZeroVec, Preheader);
+  AccHi->addIncoming(NewHi, VecLoop);
+
+  // StoreBlock: spill acc_lo/acc_hi vectors to stack for scalar reduction.
+  IRBuilder<> SB(StoreBlock);
+  SB.CreateStore(NewLo, VecLoArr);
+  SB.CreateStore(NewHi, VecHiArr);
+  SB.CreateBr(SumPre);
+
+  // SumPre: branch to scalar reduction loop.
   IRBuilder<> SP(SumPre);
-  auto VecI64x4 = VectorType::get(I64Ty, ElementCount::getScalable(4));
-  Value *WideLoad = SP.CreateLoad(VecI64x4, TempArr, "dpreroll.wide");
-
-  // Compute VF = vscale * 2 for the scalar sum loop bound
-  Function *VscaleFn = Intrinsic::getOrInsertDeclaration(
-      F.getParent(), Intrinsic::vscale, {I64Ty});
-  Value *Vscale = SP.CreateCall(VscaleFn, {}, "");
-  Value *VF = SP.CreateMul(Vscale, SP.getInt64(2), "dpreroll.vf");
-
   SP.CreateBr(SumLoop);
 
-  // Sum loop: scalar 128-bit add with carry, using extractelement
-  // from the contiguous vector load (no temp array strided load).
-  // Each iteration: extract lo=temp[iv*2], hi=temp[iv*2+1] from the
-  // wide vector, then 128-bit add with carry.
+  // SumLoop: scalar 128-bit add with carry over N elements.
+  // Uses @llvm.uadd.with.overflow for carry detection (ISel → adds+adc).
   IRBuilder<> SL(SumLoop);
   PHINode *SumIV = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_iv");
   PHINode *SumLo = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_lo");
   PHINode *SumHi = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_hi");
 
-  // Extract lo and hi from the wide vector (indices iv*2, iv*2+1)
-  Value *SLoIdx = SL.CreateMul(SumIV, SL.getInt64(2), "dpreroll.slo_idx");
-  Value *SHiIdx = SL.CreateAdd(SLoIdx, SL.getInt64(1), "dpreroll.shi_idx");
-  Value *TLo = SL.CreateExtractElement(WideLoad, SLoIdx, "dpreroll.tlo");
-  Value *THi = SL.CreateExtractElement(WideLoad, SHiIdx, "dpreroll.thi");
+  // Load vec_lo[j] and vec_hi[j] (strided scalar load from separate arrays).
+  Value *LoPtr = SL.CreateGEP(I64Ty, VecLoArr, SumIV, "dpreroll.lo_ptr");
+  Value *HiPtr = SL.CreateGEP(I64Ty, VecHiArr, SumIV, "dpreroll.hi_ptr");
+  Value *TLo = SL.CreateLoad(I64Ty, LoPtr, "dpreroll.tlo");
+  Value *THi = SL.CreateLoad(I64Ty, HiPtr, "dpreroll.thi");
 
-  // 128-bit add with carry using @llvm.uadd.with.overflow
-  Function *UAddOverflowFn = Intrinsic::getOrInsertDeclaration(
-      F.getParent(), Intrinsic::uadd_with_overflow, {I64Ty});
-  Value *AddResult = SL.CreateCall(UAddOverflowFn,
-      {SumLo, TLo}, "dpreroll.add_lo");
-  Value *NewLo = SL.CreateExtractValue(AddResult, {0}, "dpreroll.new_lo");
+  // 128-bit add with carry using @llvm.uadd.with.overflow.
+  Value *AddResult = SL.CreateIntrinsic(
+      Intrinsic::uadd_with_overflow, {I64Ty}, {SumLo, TLo}, {},
+      "dpreroll.add_lo");
+  Value *NewSumLo = SL.CreateExtractValue(AddResult, {0}, "dpreroll.new_sum_lo");
   Value *Carry = SL.CreateExtractValue(AddResult, {1}, "dpreroll.carry");
   Value *CarryExt = SL.CreateZExt(Carry, I64Ty, "dpreroll.carry_ext");
   Value *Tmp = SL.CreateAdd(SumHi, THi, "dpreroll.tmp");
-  Value *NewHi = SL.CreateAdd(Tmp, CarryExt, "dpreroll.new_hi");
+  Value *NewSumHi = SL.CreateAdd(Tmp, CarryExt, "dpreroll.new_sum_hi");
 
-  // Loop bound = VF (number of elements in the wide vector / 2)
-  Value *SumIVNext = SL.CreateAdd(SumIV, SL.getInt64(1), "dpreroll.sum_iv_next");
-  Value *SumCmp = SL.CreateICmpULT(SumIVNext, VF, "dpreroll.sum_cmp");
+  // Loop bound = N (number of vector lanes).
+  Value *SumIVNext = SL.CreateAdd(SumIV, SL.getInt64(1),
+                                 "dpreroll.sum_iv_next");
+  Value *SumCmp = SL.CreateICmpULT(SumIVNext, N, "dpreroll.sum_cmp");
   SL.CreateCondBr(SumCmp, SumLoop, AfterLoop);
 
   SumIV->addIncoming(SL.getInt64(0), SumPre);
   SumIV->addIncoming(SumIVNext, SumLoop);
   SumLo->addIncoming(SL.getInt64(0), SumPre);
-  SumLo->addIncoming(NewLo, SumLoop);
+  SumLo->addIncoming(NewSumLo, SumLoop);
   SumHi->addIncoming(SL.getInt64(0), SumPre);
-  SumHi->addIncoming(NewHi, SumLoop);
+  SumHi->addIncoming(NewSumHi, SumLoop);
 
   // AfterLoop: branch to MergeBlock (Barrett reduce).
   IRBuilder<> AB(AfterLoop);
   AB.CreateBr(MergeBlock);
 
   // Update MergeBlock's phi nodes to accept sum from AfterLoop.
-  AccLoPhi->addIncoming(NewLo, AfterLoop);
-  AccHiPhi->addIncoming(NewHi, AfterLoop);
+  AccLoPhi->addIncoming(NewSumLo, AfterLoop);
+  AccHiPhi->addIncoming(NewSumHi, AfterLoop);
 
   // Modify entry block: insert count check BEFORE the switch.
   // count==0 or count > 16 → switch (original behavior, including
