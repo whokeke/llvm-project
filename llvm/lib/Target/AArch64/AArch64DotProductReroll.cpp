@@ -262,34 +262,40 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   IV->addIncoming(LB.getInt64(0), Preheader);
   IV->addIncoming(IVNext, LoopBody);
 
-  // Sum preheader: branch to sum loop.
-  // The scalar sum loop does 128-bit add with carry over VF elements
-  // from the temp array. This has a serial carry chain and can't be
-  // vectorized, but VF is small (2-8) so it's cheap.
-  // Optimization: the loop iterates VF times (vscale*2), which is
-  // known at runtime. For 256-bit SVE (VF=2), this is 2 scalar
-  // iterations — already very efficient.
+  // Sum preheader: load temp as contiguous <vscale x 4 x i64> vector
+  // (avoids gather — just a regular vector load). The temp array is
+  // [lo0, hi0, lo1, hi1, ...] (stride-2 interleaved). Loading
+  // <vscale x 4 x i64> gives VF*2 contiguous elements = VF pairs.
+  // Then use extractelement with computed indices to get lo/hi pairs
+  // in the scalar sum loop (no gather/scatter needed).
   IRBuilder<> SP(SumPre);
+  auto VecI64x4 = VectorType::get(I64Ty, ElementCount::getScalable(4));
+  Value *WideLoad = SP.CreateLoad(VecI64x4, TempArr, "dpreroll.wide");
+
+  // Compute VF = vscale * 2 for the scalar sum loop bound
+  Function *VscaleFn = Intrinsic::getOrInsertDeclaration(
+      F.getParent(), Intrinsic::vscale, {I64Ty});
+  Value *Vscale = SP.CreateCall(VscaleFn, {}, "");
+  Value *VF = SP.CreateMul(Vscale, SP.getInt64(2), "dpreroll.vf");
+
   SP.CreateBr(SumLoop);
 
-  // Sum loop: scalar 128-bit add of all temp elements.
+  // Sum loop: scalar 128-bit add with carry, using extractelement
+  // from the contiguous vector load (no temp array strided load).
+  // Each iteration: extract lo=temp[iv*2], hi=temp[iv*2+1] from the
+  // wide vector, then 128-bit add with carry.
   IRBuilder<> SL(SumLoop);
   PHINode *SumIV = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_iv");
   PHINode *SumLo = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_lo");
   PHINode *SumHi = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_hi");
 
-  // Use @llvm.uadd.with.overflow for lo (auto-detects carry, avoids
-  // manual icmp + zext — ISel lowers to single adds instruction).
+  // Extract lo and hi from the wide vector (indices iv*2, iv*2+1)
   Value *SLoIdx = SL.CreateMul(SumIV, SL.getInt64(2), "dpreroll.slo_idx");
   Value *SHiIdx = SL.CreateAdd(SLoIdx, SL.getInt64(1), "dpreroll.shi_idx");
-  Value *SLoPtr = SL.CreateGEP(I64Ty, TempArr, SLoIdx, "dpreroll.slo_ptr");
-  Value *SHiPtr = SL.CreateGEP(I64Ty, TempArr, SHiIdx, "dpreroll.shi_ptr");
-  Value *TLo = SL.CreateLoad(I64Ty, SLoPtr, "dpreroll.tlo");
-  Value *THi = SL.CreateLoad(I64Ty, SHiPtr, "dpreroll.thi");
+  Value *TLo = SL.CreateExtractElement(WideLoad, SLoIdx, "dpreroll.tlo");
+  Value *THi = SL.CreateExtractElement(WideLoad, SHiIdx, "dpreroll.thi");
 
-  // 128-bit add with carry using @llvm.uadd.with.overflow.
-  // This lowers to adds (add + set flags) on AArch64, and the
-  // carry extraction is free (flag → register move).
+  // 128-bit add with carry using @llvm.uadd.with.overflow
   Function *UAddOverflowFn = Intrinsic::getOrInsertDeclaration(
       F.getParent(), Intrinsic::uadd_with_overflow, {I64Ty});
   Value *AddResult = SL.CreateCall(UAddOverflowFn,
@@ -300,24 +306,9 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   Value *Tmp = SL.CreateAdd(SumHi, THi, "dpreroll.tmp");
   Value *NewHi = SL.CreateAdd(Tmp, CarryExt, "dpreroll.new_hi");
 
-  // VF-based loop bound: the scalar sum only needs VF iterations
-  // (number of elements written by the vector loop), not count.
-  // This is typically 2-4, making the loop very tight.
+  // Loop bound = VF (number of elements in the wide vector / 2)
   Value *SumIVNext = SL.CreateAdd(SumIV, SL.getInt64(1), "dpreroll.sum_iv_next");
-  // Use count as the bound (VF ≤ count, and the vector loop wrote
-  // VF elements starting from 0, so the sum loop runs VF times).
-  // But we don't have VF at IR level... use count (which equals VF
-  // for the case where count is a multiple of VF, or the remainder
-  // is handled by the scalar remainder loop after).
-  // Actually, the sum loop should iterate count times because the
-  // vector loop stores count elements (1 per iteration, VF per
-  // vector iteration). Wait no — the vector loop processes VF
-  // elements per iteration but stores 1 pair per iteration (it's
-  // NOT vectorized by LoopVectorize; it's a scalar loop that
-  // LoopVectorize later vectorizes). So the temp array has count
-  // elements, and the sum loop runs count times.
-  // But count ≤ 16, so this is fine.
-  Value *SumCmp = SL.CreateICmpULT(SumIVNext, Count, "dpreroll.sum_cmp");
+  Value *SumCmp = SL.CreateICmpULT(SumIVNext, VF, "dpreroll.sum_cmp");
   SL.CreateCondBr(SumCmp, SumLoop, AfterLoop);
 
   SumIV->addIncoming(SL.getInt64(0), SumPre);
