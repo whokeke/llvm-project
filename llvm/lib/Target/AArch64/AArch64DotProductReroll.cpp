@@ -22,7 +22,6 @@
 #include "AArch64.h"
 #include "AArch64DotProductReroll.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Constants.h"
@@ -31,6 +30,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
 
@@ -369,49 +369,39 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   AccLoPhi->addIncoming(NewSumLo, AfterLoop);
   AccHiPhi->addIncoming(NewSumHi, AfterLoop);
 
-  // Modify entry block: remove the switch, branch directly to SVE loop
-  // or return. No count<=16 guard — the SVE loop handles all count values
-  // (matching the ACLE intrinsic version). The original switch-case (with
-  // tail recursion for count>16) becomes unreachable dead code, removed
-  // by DCE.
-  // Use splitBasicBlock to move the switch out of the way, then replace
-  // entry's terminator with a simple count!=0 check.
+  // Modify entry block: insert count check BEFORE the switch.
+  // count==0 or count > 16 → switch (original behavior, including
+  //   case 0 return + default tail recursion for count > 16).
+  // 1 ≤ count ≤ 16 → SVE vector loop (no 128-bit overflow because
+  //   SEAL_MULTIPLY_ACCUMULATE_MOD_MAX = 16 guarantees
+  //   16 * (modulus-1)^2 < 2^128).
+  //
+  // The switch-case is kept reachable (for count > 16) — no dead code,
+  // no dominance issues. No alwaysinline — the function is not inlined
+  // into callers (CGSCC inliner already ran and saw the switch-case).
   BasicBlock *SwitchBlock = Entry->splitBasicBlock(
       Switch->getIterator(), "dpreroll.switch");
-  (void)SwitchBlock; // moved out of the way; becomes unreachable dead code
-  // Entry's terminator is now `br label %SwitchBlock`. Replace it.
+  (void)SwitchBlock;
   Entry->getTerminator()->eraseFromParent();
   IRBuilder<> EB(Entry);
-  Value *CountNotZero = EB.CreateICmpNE(Count, EB.getInt64(0),
-                                        "dpreroll.count_not_zero");
-  EB.CreateCondBr(CountNotZero, Preheader, ReturnBlock);
+  Value *CountLE16 = EB.CreateICmpULE(Count, EB.getInt64(16),
+                                      "dpreroll.count_le16");
+  Value *CountGT0 = EB.CreateICmpNE(Count, EB.getInt64(0),
+                                    "dpreroll.count_gt0");
+  Value *UseLoop = EB.CreateAnd(CountGT0, CountLE16,
+                                "dpreroll.use_loop");
+  EB.CreateCondBr(UseLoop, Preheader, SwitchBlock);
 
-  // Remove self-calls (recursive tail recursion in the switch-case default
-  // branch) to prevent the inliner from marking the function as "recursive"
-  // (cost=never), which would block inlining even with alwaysinline.
-  //
-  // We replace self-calls with poison instead of removeUnreachableBlocks(F)
-  // because the latter can break dominance during LTO: the pre-LTO pipeline
-  // may have hoisted instructions from case blocks into the merge block,
-  // creating cross-block references that become dangling when the case
-  // blocks are removed. Replacing just the self-call with poison is safe —
-  // no blocks are removed, and DCE/InstCombine clean up the dead code later.
-  SmallVector<CallBase *, 4> SelfCalls;
-  for (Instruction &I : instructions(F))
-    if (auto *CB = dyn_cast<CallBase>(&I))
-      if (CB->getCalledFunction() == &F)
-        SelfCalls.push_back(CB);
-  for (CallBase *CB : SelfCalls) {
-    CB->replaceAllUsesWith(PoisonValue::get(CB->getType()));
-    CB->eraseFromParent();
+  // Update phi nodes in blocks that had Entry as predecessor but now
+  // have SwitchBlock (because the switch moved there).
+  for (BasicBlock *BB : {ReturnBlock}) {
+    for (PHINode &PN : BB->phis()) {
+      for (unsigned i = 0; i < PN.getNumIncomingValues(); i++) {
+        if (PN.getIncomingBlock(i) == Entry)
+          PN.setIncomingBlock(i, SwitchBlock);
+      }
+    }
   }
-
-  // Mark the function alwaysinline so the compact SVE loop (no switch-case)
-  // gets inlined into callers (e.g. fast_convert_array). The CGSCC inliner
-  // ran before this pass and saw the large switch-case; this attribute lets
-  // AlwaysInlinerPass (added after this pass in the pipeline) inline the
-  // now-compact function.
-  F.addFnAttr(Attribute::AlwaysInline);
 
   LLVM_DEBUG(dbgs() << "DPREROLL: rerolled dot_product_mod into loop!\n");
 

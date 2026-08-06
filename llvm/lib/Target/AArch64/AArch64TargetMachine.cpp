@@ -57,7 +57,6 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/CFGuard.h"
-#include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/LowerIFunc.h"
 #include "llvm/Transforms/Vectorize/LoopIdiomVectorize.h"
@@ -640,15 +639,6 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         // SwitchKeyVectorize runs at VectorizerStartEP (below) where loops
         // are already canonicalized by loop-simplify/loop-rotate.
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-        // DotProductReroll marks dot_product_mod as alwaysinline after
-        // transforming it from a large switch-case into a compact SVE loop.
-        // The CGSCC inliner already ran (before OptimizerEarlyEP) and saw
-        // the large switch-case, so it didn't inline. AlwaysInlinerPass
-        // here gives a second chance to inline the now-compact function
-        // into callers (e.g. fast_convert_array). Safe because the
-        // transformed function has no recursive calls (switch-case with
-        // tail recursion is removed as dead code).
-        MPM.addPass(AlwaysInlinerPass());
       });
 
   PB.registerVectorizerStartEPCallback(
