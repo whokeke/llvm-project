@@ -15,6 +15,12 @@
 /// to `gather(ptrue)`. By converting the splat-ptr gather to a regular
 /// scalar load + splat, LICM can hoist the load naturally.
 ///
+/// Since GatherHoist runs at OptimizerLastEP (after LoopVectorize, after
+/// LICM), there is no subsequent LICM to hoist the scalar load. The pass
+/// therefore hoists the scalar_load + splat to the loop preheader itself
+/// when the gather is inside a loop and the scalar pointer is loop-invariant.
+/// The mask-dependent select remains at the gather's original position.
+///
 /// Gated on `-aarch64-gather-hoist` (off by default).
 /// Runs at OptimizerLastEP (after LoopVectorize, before ISel).
 //===----------------------------------------------------------------------===//
@@ -80,8 +86,10 @@ AArch64GatherHoistPass::run(Function &F, FunctionAnalysisManager &AM) {
     errs() << "GATHER_HOIST: processing " << F.getName()
            << " loops=" << LI.getLoopsInPreorder().size() << "\n";
 
-  // Scan ALL instructions (not just in loops — we replace the pattern
-  // everywhere; LICM will handle hoisting if it's in a loop).
+  // Scan ALL instructions (not just in loops). For each splat-ptr gather,
+  // if it's inside a loop with a loop-invariant scalar pointer, the load
+  // + splat are hoisted to the loop preheader directly (no reliance on
+  // a subsequent LICM pass). Otherwise they stay at the gather's position.
   for (BasicBlock &BB : F) {
     SmallVector<IntrinsicInst *, 4> ToTransform;
     for (Instruction &I : BB) {
@@ -111,28 +119,52 @@ AArch64GatherHoistPass::run(Function &F, FunctionAnalysisManager &AM) {
         errs() << "GATHER_HOIST: replacing splat-ptr gather in "
                << F.getName() << " scalar_ptr=" << *ScalarPtr << "\n";
 
-      IRBuilder<> B(Gather);
+      // Determine insertion point for scalar load + splat.
+      // If the gather is inside a loop and the scalar pointer is
+      // loop-invariant, hoist the load + splat to the loop preheader.
+      // GatherHoist runs after LICM (at OptimizerLastEP), so LICM won't
+      // hoist the newly-created scalar load — we must do it ourselves.
+      Instruction *LoadInsertPt = Gather;
+      Loop *L = LI.getLoopFor(Gather->getParent());
+      if (L) {
+        if (BasicBlock *Preheader = L->getLoopPreheader()) {
+          // Only hoist if the scalar pointer is loop-invariant.
+          bool CanHoist = true;
+          if (auto *PtrI = dyn_cast<Instruction>(ScalarPtr))
+            CanHoist = !L->contains(PtrI);
+          if (CanHoist) {
+            LoadInsertPt = Preheader->getTerminator();
+            if (Debug)
+              errs() << "GATHER_HOIST: hoisting scalar_load to preheader "
+                     << Preheader->getName() << "\n";
+          }
+        }
+      }
 
-      // Create scalar load from the splat base address.
-      Value *ScalarLoad = B.CreateLoad(EltTy, ScalarPtr,
-                                        "gh.scalar_load");
+      // Create scalar load (hoisted to preheader if in loop + invariant).
+      IRBuilder<> LB(LoadInsertPt);
+      Value *ScalarLoad = LB.CreateLoad(EltTy, ScalarPtr,
+                                         "gh.scalar_load");
 
-      // Splat the scalar to all lanes.
-      Value *Splat = B.CreateVectorSplat(
+      // Splat the scalar to all lanes. Splat depends only on ScalarLoad,
+      // so it can be placed right after the load (hoisted together).
+      Value *Splat = LB.CreateVectorSplat(
           cast<VectorType>(VecTy)->getElementCount(),
           ScalarLoad, "gh.splat");
 
-      // Apply mask: for inactive lanes, use passthru.
+      // Apply mask: for inactive lanes, use passthru. The mask may be
+      // loop-variant, so the select stays at the gather's original position.
+      IRBuilder<> SB(Gather);
       Value *Result;
       if (isa<PoisonValue>(Passthru)) {
         // With poison passthru, the gather returns poison for inactive
         // lanes. But our splat returns the loaded value for ALL lanes.
         // Use select to match the original semantics.
-        Result = B.CreateSelect(Mask, Splat,
-                                ConstantAggregateZero::get(VecTy),
-                                "gh.result");
+        Result = SB.CreateSelect(Mask, Splat,
+                                 ConstantAggregateZero::get(VecTy),
+                                 "gh.result");
       } else {
-        Result = B.CreateSelect(Mask, Splat, Passthru, "gh.result");
+        Result = SB.CreateSelect(Mask, Splat, Passthru, "gh.result");
       }
 
       Gather->replaceAllUsesWith(Result);

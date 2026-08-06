@@ -30,6 +30,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 
@@ -368,40 +369,36 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   AccLoPhi->addIncoming(NewSumLo, AfterLoop);
   AccHiPhi->addIncoming(NewSumHi, AfterLoop);
 
-  // Modify entry block: insert count check BEFORE the switch.
-  // count==0 or count > 16 → switch (original behavior, including
-  //   case 0 return + default tail recursion for count > 16).
-  // 1 ≤ count ≤ 16 → rerolled loop (vectorizable, no 128-bit overflow
-  //   because SEAL_MULTIPLY_ACCUMULATE_MOD_MAX = 16 guarantees
-  //   16 * (modulus-1)^2 < 2^128).
-  //
-  // Use splitBasicBlock to move the switch (and everything after it)
-  // to a new block, then replace entry's terminator with a condbr.
+  // Modify entry block: remove the switch, branch directly to SVE loop
+  // or return. No count<=16 guard — the SVE loop handles all count values
+  // (matching the ACLE intrinsic version). The original switch-case (with
+  // tail recursion for count>16) becomes unreachable dead code, removed
+  // by DCE.
+  // Use splitBasicBlock to move the switch out of the way, then replace
+  // entry's terminator with a simple count!=0 check.
   BasicBlock *SwitchBlock = Entry->splitBasicBlock(
       Switch->getIterator(), "dpreroll.switch");
+  (void)SwitchBlock; // moved out of the way; becomes unreachable dead code
   // Entry's terminator is now `br label %SwitchBlock`. Replace it.
   Entry->getTerminator()->eraseFromParent();
   IRBuilder<> EB(Entry);
-  Value *CountLE16 = EB.CreateICmpULE(Count, EB.getInt64(16),
-                                      "dpreroll.count_le16");
-  Value *CountGT0 = EB.CreateICmpNE(Count, EB.getInt64(0),
-                                    "dpreroll.count_gt0");
-  Value *UseLoop = EB.CreateAnd(CountGT0, CountLE16,
-                                "dpreroll.use_loop");
-  EB.CreateCondBr(UseLoop, Preheader, SwitchBlock);
+  Value *CountNotZero = EB.CreateICmpNE(Count, EB.getInt64(0),
+                                        "dpreroll.count_not_zero");
+  EB.CreateCondBr(CountNotZero, Preheader, ReturnBlock);
 
-  // Update phi nodes in blocks that had Entry as predecessor but now
-  // have SwitchBlock (because the switch moved there). The key one is
-  // ReturnBlock — case 0's phi has [count, Entry] which needs to
-  // become [count, SwitchBlock].
-  for (BasicBlock *BB : {ReturnBlock}) {
-    for (PHINode &PN : BB->phis()) {
-      for (unsigned i = 0; i < PN.getNumIncomingValues(); i++) {
-        if (PN.getIncomingBlock(i) == Entry)
-          PN.setIncomingBlock(i, SwitchBlock);
-      }
-    }
-  }
+  // Remove the original switch-case blocks (now unreachable) so the function
+  // has no recursive call. The inliner marks functions with self-calls as
+  // "recursive" (cost=never) and refuses to inline, even if the call is in
+  // dead code. Removing the unreachable blocks eliminates the recursive call
+  // from the function body, allowing AlwaysInlinerPass to inline it.
+  removeUnreachableBlocks(F);
+
+  // Mark the function alwaysinline so the compact SVE loop (no switch-case)
+  // gets inlined into callers (e.g. fast_convert_array). The CGSCC inliner
+  // ran before this pass and saw the large switch-case; this attribute lets
+  // AlwaysInlinerPass (added after this pass in the pipeline) inline the
+  // now-compact function.
+  F.addFnAttr(Attribute::AlwaysInline);
 
   LLVM_DEBUG(dbgs() << "DPREROLL: rerolled dot_product_mod into loop!\n");
 
