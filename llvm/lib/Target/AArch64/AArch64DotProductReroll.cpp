@@ -22,6 +22,7 @@
 #include "AArch64.h"
 #include "AArch64DotProductReroll.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Constants.h"
@@ -31,6 +32,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 
@@ -206,6 +208,14 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   LLVM_DEBUG(dbgs() << "  acc_lo phi=" << *AccLoPhi << "\n"
                     << "  acc_hi phi=" << *AccHiPhi << "\n");
+
+  // Clone the function BEFORE transformation to preserve the original
+  // switch-case (for count > 16). The clone (dot_product_mod_large) handles
+  // the tail recursion path. After transformation, self-calls in F are
+  // redirected to the clone → F is no longer recursive → safe to alwaysinline.
+  ValueToValueMapTy VMap;
+  Function *LargeFn = CloneFunction(&F, VMap);
+  LargeFn->setName(Twine(F.getName()) + "_large");
 
   // --- Generate the SVE vector loop ---
   // Instead of a scalar mul+store loop + scalar reduction (which relied on
@@ -402,6 +412,35 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
       }
     }
   }
+
+  // Replace self-calls (recursive tail recursion in switch-case default)
+  // with calls to LargeFn (the clone). This makes F non-recursive, so
+  // AlwaysInlinerPass can inline it without the "recursive" cost=never
+  // rejection. LargeFn keeps its own self-call (recursive) for count>16
+  // tail recursion — that's fine, it's not alwaysinline.
+  SmallVector<CallBase *, 4> SelfCalls;
+  for (Instruction &I : instructions(F))
+    if (auto *CB = dyn_cast<CallBase>(&I))
+      if (CB->getCalledFunction() == &F)
+        SelfCalls.push_back(CB);
+  for (CallBase *CB : SelfCalls) {
+    IRBuilder<> B(CB);
+    SmallVector<Value *, 4> Args;
+    for (unsigned i = 0; i < CB->arg_size(); i++)
+      Args.push_back(CB->getArgOperand(i));
+    CallInst *NewCall = B.CreateCall(LargeFn, Args);
+    NewCall->setDebugLoc(CB->getDebugLoc());
+    CB->replaceAllUsesWith(NewCall);
+    CB->eraseFromParent();
+  }
+
+  // Mark F as alwaysinline. It's now non-recursive (self-calls redirected
+  // to LargeFn). AlwaysInlinerPass (added after this pass in the pipeline)
+  // will inline F into callers (e.g. fast_convert_array). The inlined code
+  // has: SVE loop (count<=16, compact) + switch-case (count>16, cold,
+  // calls LargeFn — not inlined). The switch-case is reachable (no dead
+  // code, no dominance issues).
+  F.addFnAttr(Attribute::AlwaysInline);
 
   LLVM_DEBUG(dbgs() << "DPREROLL: rerolled dot_product_mod into loop!\n");
 

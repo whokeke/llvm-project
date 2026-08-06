@@ -57,6 +57,7 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/CFGuard.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/LowerIFunc.h"
 #include "llvm/Transforms/Vectorize/LoopIdiomVectorize.h"
@@ -663,7 +664,13 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         if (Level != OptimizationLevel::O0) {
           FunctionPassManager FPM;
           FPM.addPass(AArch64GatherHoistPass());
-          MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+        // DotProductReroll clones dot_product_mod, redirects self-calls to
+        // the clone, and marks the original as alwaysinline. This pass
+        // inlines the now-non-recursive function into callers (e.g.
+        // fast_convert_array). The switch-case (count>16) stays reachable
+        // — no dead code, no dominance issues.
+        MPM.addPass(AlwaysInlinerPass());
         }
       });
   if (getTargetTriple().isOSWindows())
