@@ -87,102 +87,89 @@ static PHINode *findPtrPhiWithStep(Loop *L, uint64_t ExpectedStep,
 }
 
 /// Find the loop's exit count from ptr-based exit condition.
+/// Scans all blocks in the loop for `icmp eq/ne ptr %phi, %end` where
+/// %phi is one of the loop's ptr phis and %end is loop-invariant.
 /// Returns the count value if recoverable.
-static Value *findExitCount(Loop *L, IRBuilder<> &B, const DataLayout &DL) {
-  BasicBlock *Latch = L->getLoopLatch();
-  if (!Latch)
-    return nullptr;
-
-  // Find the ptr phi and end pointer from the exit condition.
-  // The exit condition is either `icmp eq ptr %curr, %end` or a
-  // select chain of such comparisons.
-  auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
-  if (!Br)
-    return nullptr;
-
-  // Walk through select chain to find an icmp eq ptr
-  Value *Cond = Br->getCondition();
-  ICmpInst *PtrCmp = nullptr;
-  SmallPtrSet<Value *, 4> Visited;
-  while (auto *SI = dyn_cast<SelectInst>(Cond)) {
-    if (!Visited.insert(SI).second)
-      break;
-    for (auto *V : {SI->getTrueValue(), SI->getFalseValue()}) {
-      if (auto *IC = dyn_cast<ICmpInst>(V)) {
-        if (IC->getPredicate() == ICmpInst::ICMP_EQ &&
-            IC->getOperand(0)->getType()->isPointerTy()) {
-          PtrCmp = IC;
-          break;
+static Value *findExitCount(Loop *L, IRBuilder<> &B, const DataLayout &DL,
+                            SmallVectorImpl<PHINode *> &PtrPhis) {
+  // For each ptr phi, scan loop blocks for icmp involving the phi.
+  // The icmp might compare the phi directly, OR a GEP of the phi
+  // (SEAL_ITERATE checks `gep %phi, step == end`, not `%phi == end`).
+  for (PHINode *Phi : PtrPhis) {
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        auto *IC = dyn_cast<ICmpInst>(&I);
+        if (!IC)
+          continue;
+        if (IC->getPredicate() != ICmpInst::ICMP_EQ &&
+            IC->getPredicate() != ICmpInst::ICMP_NE)
+          continue;
+        // Check if one operand traces back to the phi (directly or via GEP)
+        Value *Other = nullptr;
+        for (int dir = 0; dir < 2; dir++) {
+          Value *Op = IC->getOperand(dir);
+          // Direct phi match
+          if (Op == Phi) {
+            Other = IC->getOperand(1 - dir);
+            break;
+          }
+          // GEP of phi match: gep T, ptr %phi, i64 N
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(Op)) {
+            if (GEP->getPointerOperand() == Phi) {
+              Other = IC->getOperand(1 - dir);
+              break;
+            }
+          }
         }
+        if (!Other)
+          continue;
+        // Check if Other is loop-invariant
+        if (auto *OtherI = dyn_cast<Instruction>(Other))
+          if (L->contains(OtherI))
+            continue;
+        // Found the end pointer!
+        Value *End = Other;
+        // Find start (phi's initial value from preheader)
+        Value *Start = nullptr;
+        for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+          if (!L->contains(Phi->getIncomingBlock(i))) {
+            Start = Phi->getIncomingValue(i);
+            break;
+          }
+        }
+        if (!Start)
+          continue;
+        // Find back-edge GEP step
+        Value *BackVal = nullptr;
+        for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+          if (L->contains(Phi->getIncomingBlock(i))) {
+            BackVal = Phi->getIncomingValue(i);
+            break;
+          }
+        }
+        if (!BackVal)
+          continue;
+        auto *BackGEP = dyn_cast<GetElementPtrInst>(BackVal);
+        if (!BackGEP || BackGEP->getNumOperands() != 2)
+          continue;
+        auto *StepC = dyn_cast<ConstantInt>(BackGEP->getOperand(1));
+        if (!StepC)
+          continue;
+        uint64_t StepBytes = StepC->getZExtValue() *
+                             DL.getTypeAllocSize(BackGEP->getSourceElementType());
+        if (StepBytes == 0)
+          continue;
+        // Compute trip count = (ptrtoint(end) - ptrtoint(start)) / step
+        Type *I64Ty = B.getInt64Ty();
+        Value *StartInt = B.CreatePtrToInt(Start, I64Ty);
+        Value *EndInt = B.CreatePtrToInt(End, I64Ty);
+        Value *Diff = B.CreateSub(EndInt, StartInt);
+        Value *TC = B.CreateSDiv(Diff, B.getInt64(StepBytes));
+        return TC;
       }
     }
-    if (PtrCmp)
-      break;
-    Cond = SI->getTrueValue();
   }
-  if (!PtrCmp) {
-    if (auto *IC = dyn_cast<ICmpInst>(Br->getCondition())) {
-      if (IC->getPredicate() == ICmpInst::ICMP_EQ &&
-          IC->getOperand(0)->getType()->isPointerTy())
-        PtrCmp = IC;
-    }
-  }
-  if (!PtrCmp)
-    return nullptr;
-
-  // Find the phi and end
-  PHINode *Phi = nullptr;
-  Value *End = nullptr;
-  for (int dir = 0; dir < 2; dir++) {
-    Value *A = PtrCmp->getOperand(dir);
-    Value *B = PtrCmp->getOperand(1 - dir);
-    if ((Phi = dyn_cast<PHINode>(A))) {
-      End = B;
-      break;
-    }
-  }
-  if (!Phi || !End)
-    return nullptr;
-
-  // Find start (initial value from preheader)
-  Value *Start = nullptr;
-  for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-    if (!L->contains(Phi->getIncomingBlock(i))) {
-      Start = Phi->getIncomingValue(i);
-      break;
-    }
-  }
-  if (!Start)
-    return nullptr;
-
-  // Find back-edge GEP step
-  Value *BackVal = nullptr;
-  for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-    if (L->contains(Phi->getIncomingBlock(i))) {
-      BackVal = Phi->getIncomingValue(i);
-      break;
-    }
-  }
-  if (!BackVal)
-    return nullptr;
-  auto *BackGEP = dyn_cast<GetElementPtrInst>(BackVal);
-  if (!BackGEP || BackGEP->getNumOperands() != 2)
-    return nullptr;
-  auto *StepC = dyn_cast<ConstantInt>(BackGEP->getOperand(1));
-  if (!StepC)
-    return nullptr;
-  uint64_t StepBytes = StepC->getZExtValue() *
-                       DL.getTypeAllocSize(BackGEP->getSourceElementType());
-  if (StepBytes == 0)
-    return nullptr;
-
-  // Compute trip count = (ptrtoint(end) - ptrtoint(start)) / step
-  Type *I64Ty = B.getInt64Ty();
-  Value *StartInt = B.CreatePtrToInt(Start, I64Ty);
-  Value *EndInt = B.CreatePtrToInt(End, I64Ty);
-  Value *Diff = B.CreateSub(EndInt, StartInt);
-  Value *TC = B.CreateSDiv(Diff, B.getInt64(StepBytes));
-  return TC;
+  return nullptr;
 }
 
 /// Generate a vectorized mul+accumulate loop.
@@ -292,7 +279,11 @@ static bool vectorizeMulAddLoop(Loop *L, Function &F,
 
   // Compute trip count
   IRBuilder<> PB(Preheader, Preheader->getTerminator()->getIterator());
-  Value *TripCount = findExitCount(L, PB, DL);
+  SmallVector<PHINode *, 4> PtrPhis;
+  PtrPhis.push_back(OpPhi);
+  PtrPhis.push_back(KeyPhi);
+  PtrPhis.push_back(AccPhi);
+  Value *TripCount = findExitCount(L, PB, DL, PtrPhis);
   if (!TripCount) {
     if (Debug)
       errs() << "SWITCH_KEY_VEC: can't find exit count, skip\n";
@@ -360,18 +351,13 @@ static bool vectorizeMulAddLoop(Loop *L, Function &F,
        I64Ty});
   Value *Pred = VL.CreateCall(WhileloFn, {IV, TripCount}, "skv.pred");
 
-  // Contiguous loads: t_operand[IV] and key[IV]
+  // Contiguous masked loads: t_operand[IV] and key[IV]
   Value *OpElem = VL.CreateGEP(I64Ty, OpStart, IV, "skv.op_elem");
   Value *KeyElem = VL.CreateGEP(I64Ty, KeyStart, IV, "skv.key_elem");
-  // Use masked load for predicated tail handling
-  Function *MaskedLoadFn = Intrinsic::getOrInsertDeclaration(
-      F.getParent(), Intrinsic::masked_load, {VecI64});
-  Value *VOp = VL.CreateCall(MaskedLoadFn,
-      {OpElem, VL.getInt32(8), Pred,
-       ConstantAggregateZero::get(VecI64)}, "skv.vop");
-  Value *VKey = VL.CreateCall(MaskedLoadFn,
-      {KeyElem, VL.getInt32(8), Pred,
-       ConstantAggregateZero::get(VecI64)}, "skv.vkey");
+  Value *VOp = VL.CreateMaskedLoad(VecI64, OpElem, Align(8), Pred,
+      ConstantAggregateZero::get(VecI64), "skv.vop");
+  Value *VKey = VL.CreateMaskedLoad(VecI64, KeyElem, Align(8), Pred,
+      ConstantAggregateZero::get(VecI64), "skv.vkey");
 
   // 64x64→128 mul
   Value *VLo = VL.CreateMul(VOp, VKey, "skv.vlo");
@@ -392,19 +378,20 @@ static bool vectorizeMulAddLoop(Loop *L, Function &F,
       VL.CreateCall(Intrinsic::getOrInsertDeclaration(
           F.getParent(), Intrinsic::stepvector, {VecI64}), {}),
       "skv.lane");
-  Value *LoIdxVec = VL.CreateMul(LaneIdx, VL.getInt64(2), "skv.lo_idx_vec");
-  Value *HiIdxVec = VL.CreateAdd(LoIdxVec, VL.getInt64(1), "skv.hi_idx_vec");
+  Value *Stride2 = VL.CreateVectorSplat(VecI64->getElementCount(),
+      VL.getInt64(2), "skv.stride2");
+  Value *One = VL.CreateVectorSplat(VecI64->getElementCount(),
+      VL.getInt64(1), "skv.one");
+  Value *LoIdxVec = VL.CreateMul(LaneIdx, Stride2, "skv.lo_idx_vec");
+  Value *HiIdxVec = VL.CreateAdd(LoIdxVec, One, "skv.hi_idx_vec");
   Value *LoPtrVec = VL.CreateGEP(I64Ty, AccStart, LoIdxVec, "skv.lo_ptr_vec");
   Value *HiPtrVec = VL.CreateGEP(I64Ty, AccStart, HiIdxVec, "skv.hi_ptr_vec");
 
-  Function *GatherFn = Intrinsic::getOrInsertDeclaration(
-      F.getParent(), Intrinsic::masked_gather, {VecI64});
-  Value *VAccLo = VL.CreateCall(GatherFn,
-      {LoPtrVec, VL.getInt32(8), Pred,
-       ConstantAggregateZero::get(VecI64)}, "skv.vacc_lo");
-  Value *VAccHi = VL.CreateCall(GatherFn,
-      {HiPtrVec, VL.getInt32(8), Pred,
-       ConstantAggregateZero::get(VecI64)}, "skv.vacc_hi");
+  // Use CreateMaskedGather (auto-adds align parameter attribute)
+  Value *VAccLo = VL.CreateMaskedGather(VecI64, LoPtrVec, Align(8), Pred,
+      ConstantAggregateZero::get(VecI64), "skv.vacc_lo");
+  Value *VAccHi = VL.CreateMaskedGather(VecI64, HiPtrVec, Align(8), Pred,
+      ConstantAggregateZero::get(VecI64), "skv.vacc_hi");
 
   // 128-bit add with carry: (acc_lo, acc_hi) += (lo, hi)
   Value *VNewLo = VL.CreateAdd(VAccLo, VLo, "skv.new_lo");
@@ -413,11 +400,9 @@ static bool vectorizeMulAddLoop(Loop *L, Function &F,
   Value *VTmp = VL.CreateAdd(VAccHi, VHi, "skv.vtmp");
   Value *VNewHi = VL.CreateAdd(VTmp, CarryExt, "skv.new_hi");
 
-  // Strided stores back to accumulator
-  Function *ScatterFn = Intrinsic::getOrInsertDeclaration(
-      F.getParent(), Intrinsic::masked_scatter, {VecI64});
-  VL.CreateCall(ScatterFn, {VNewLo, LoPtrVec, VL.getInt32(8), Pred});
-  VL.CreateCall(ScatterFn, {VNewHi, HiPtrVec, VL.getInt32(8), Pred});
+  // Use CreateMaskedScatter (auto-adds align parameter attribute)
+  VL.CreateMaskedScatter(VNewLo, LoPtrVec, Align(8), Pred);
+  VL.CreateMaskedScatter(VNewHi, HiPtrVec, Align(8), Pred);
 
   // IV += VF, loop back
   Value *IVNext = VL.CreateAdd(IV, VF, "skv.iv_next");
