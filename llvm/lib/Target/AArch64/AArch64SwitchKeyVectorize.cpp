@@ -364,30 +364,24 @@ static bool vectorizeMulAddLoop(Loop *L, Function &F,
   Value *VHi = VL.CreateCall(UmulFixFn, {VOp, VKey, VL.getInt32(64)},
                               "skv.vhi");
 
-  // Strided accumulator loads: acc[IV*2] (lo) and acc[IV*2+1] (hi)
-  // acc layout: [lo0, hi0, lo1, hi1, ...] — stride 2 elements = 16 bytes
-  Value *Idx2 = VL.CreateMul(IV, VL.getInt64(2), "skv.idx2");
-  Value *Idx2p1 = VL.CreateAdd(Idx2, VL.getInt64(1), "skv.idx2p1");
-  Value *AccLoElem = VL.CreateGEP(I64Ty, AccStart, Idx2, "skv.acc_lo_elem");
-  Value *AccHiElem = VL.CreateGEP(I64Ty, AccStart, Idx2p1, "skv.acc_hi_elem");
-
-  // Use gather load for strided accumulator access
-  // Build pointer vector for gather
+  // Accumulator access: acc layout is [lo0, hi0, lo1, hi1, ...] (stride-2).
+  // Use gather/scatter for strided access. This is more expensive than
+  // ld2d/st2d but works correctly. Future optimization: use ld2d/st2d
+  // via <vscale x 4 x i64> load + deinterleave.
   Value *LaneIdx = VL.CreateAdd(
       VL.CreateVectorSplat(VecI64->getElementCount(), IV),
       VL.CreateCall(Intrinsic::getOrInsertDeclaration(
           F.getParent(), Intrinsic::stepvector, {VecI64}), {}),
       "skv.lane");
-  Value *Stride2 = VL.CreateVectorSplat(VecI64->getElementCount(),
+  Value *Stride2Vec = VL.CreateVectorSplat(VecI64->getElementCount(),
       VL.getInt64(2), "skv.stride2");
-  Value *One = VL.CreateVectorSplat(VecI64->getElementCount(),
+  Value *OneVec = VL.CreateVectorSplat(VecI64->getElementCount(),
       VL.getInt64(1), "skv.one");
-  Value *LoIdxVec = VL.CreateMul(LaneIdx, Stride2, "skv.lo_idx_vec");
-  Value *HiIdxVec = VL.CreateAdd(LoIdxVec, One, "skv.hi_idx_vec");
+  Value *LoIdxVec = VL.CreateMul(LaneIdx, Stride2Vec, "skv.lo_idx_vec");
+  Value *HiIdxVec = VL.CreateAdd(LoIdxVec, OneVec, "skv.hi_idx_vec");
   Value *LoPtrVec = VL.CreateGEP(I64Ty, AccStart, LoIdxVec, "skv.lo_ptr_vec");
   Value *HiPtrVec = VL.CreateGEP(I64Ty, AccStart, HiIdxVec, "skv.hi_ptr_vec");
 
-  // Use CreateMaskedGather (auto-adds align parameter attribute)
   Value *VAccLo = VL.CreateMaskedGather(VecI64, LoPtrVec, Align(8), Pred,
       ConstantAggregateZero::get(VecI64), "skv.vacc_lo");
   Value *VAccHi = VL.CreateMaskedGather(VecI64, HiPtrVec, Align(8), Pred,
@@ -400,7 +394,7 @@ static bool vectorizeMulAddLoop(Loop *L, Function &F,
   Value *VTmp = VL.CreateAdd(VAccHi, VHi, "skv.vtmp");
   Value *VNewHi = VL.CreateAdd(VTmp, CarryExt, "skv.new_hi");
 
-  // Use CreateMaskedScatter (auto-adds align parameter attribute)
+  // Stores: scatter back to strided accumulator
   VL.CreateMaskedScatter(VNewLo, LoPtrVec, Align(8), Pred);
   VL.CreateMaskedScatter(VNewHi, HiPtrVec, Align(8), Pred);
 
