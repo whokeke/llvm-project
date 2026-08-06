@@ -22,6 +22,7 @@
 #include "AArch64.h"
 #include "AArch64DotProductReroll.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Constants.h"
@@ -30,7 +31,6 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 
@@ -386,12 +386,25 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
                                         "dpreroll.count_not_zero");
   EB.CreateCondBr(CountNotZero, Preheader, ReturnBlock);
 
-  // Remove the original switch-case blocks (now unreachable) so the function
-  // has no recursive call. The inliner marks functions with self-calls as
-  // "recursive" (cost=never) and refuses to inline, even if the call is in
-  // dead code. Removing the unreachable blocks eliminates the recursive call
-  // from the function body, allowing AlwaysInlinerPass to inline it.
-  removeUnreachableBlocks(F);
+  // Remove self-calls (recursive tail recursion in the switch-case default
+  // branch) to prevent the inliner from marking the function as "recursive"
+  // (cost=never), which would block inlining even with alwaysinline.
+  //
+  // We replace self-calls with poison instead of removeUnreachableBlocks(F)
+  // because the latter can break dominance during LTO: the pre-LTO pipeline
+  // may have hoisted instructions from case blocks into the merge block,
+  // creating cross-block references that become dangling when the case
+  // blocks are removed. Replacing just the self-call with poison is safe —
+  // no blocks are removed, and DCE/InstCombine clean up the dead code later.
+  SmallVector<CallBase *, 4> SelfCalls;
+  for (Instruction &I : instructions(F))
+    if (auto *CB = dyn_cast<CallBase>(&I))
+      if (CB->getCalledFunction() == &F)
+        SelfCalls.push_back(CB);
+  for (CallBase *CB : SelfCalls) {
+    CB->replaceAllUsesWith(PoisonValue::get(CB->getType()));
+    CB->eraseFromParent();
+  }
 
   // Mark the function alwaysinline so the compact SVE loop (no switch-case)
   // gets inlined into callers (e.g. fast_convert_array). The CGSCC inliner
