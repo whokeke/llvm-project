@@ -236,22 +236,13 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   Constant *ZeroVec = Constant::getNullValue(Nxv2I64);
 
   // Allocas for horizontal reduction storage (store acc_lo/acc_hi vectors).
-  const unsigned MaxVec = 8; // max svcntd() for up to 512-bit SVE
+
   IRBuilder<> EB0(Entry, Entry->getFirstInsertionPt());
-  AllocaInst *VecLoArr = EB0.CreateAlloca(
-      ArrayType::get(I64Ty, MaxVec), nullptr, "dpreroll.vec_lo");
-  AllocaInst *VecHiArr = EB0.CreateAlloca(
-      ArrayType::get(I64Ty, MaxVec), nullptr, "dpreroll.vec_hi");
-  VecLoArr->setAlignment(Align(16));
-  VecHiArr->setAlignment(Align(16));
 
   // Create blocks.
   BasicBlock *Preheader = BasicBlock::Create(Ctx, "dpreroll.ph", &F);
   BasicBlock *VecLoop = BasicBlock::Create(Ctx, "dpreroll.vloop", &F);
-  BasicBlock *StoreBlock = BasicBlock::Create(Ctx, "dpreroll.store", &F);
-  BasicBlock *SumPre = BasicBlock::Create(Ctx, "dpreroll.sumph", &F);
-  BasicBlock *SumLoop = BasicBlock::Create(Ctx, "dpreroll.sumloop", &F);
-  BasicBlock *AfterLoop = BasicBlock::Create(Ctx, "dpreroll.after", &F);
+  BasicBlock *TreeStart = BasicBlock::Create(Ctx, "dpreroll.tstart", &F);
 
   // Preheader: compute N = vscale * 2 (= svcntd()).
   IRBuilder<> PB(Preheader);
@@ -316,7 +307,7 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   // IV += N, loop condition (do-while: always runs at least once).
   Value *IVNext = VL.CreateAdd(IV, N, "dpreroll.iv_next");
   Value *Cmp = VL.CreateICmpULT(IVNext, Count, "dpreroll.cmp");
-  VL.CreateCondBr(Cmp, VecLoop, StoreBlock);
+  VL.CreateCondBr(Cmp, VecLoop, TreeStart);
 
   IV->addIncoming(PB.getInt64(0), Preheader);
   IV->addIncoming(IVNext, VecLoop);
@@ -325,59 +316,104 @@ AArch64DotProductRerollPass::run(Function &F, FunctionAnalysisManager &AM) {
   AccHi->addIncoming(ZeroVec, Preheader);
   AccHi->addIncoming(NewHi, VecLoop);
 
-  // StoreBlock: spill acc_lo/acc_hi vectors to stack for scalar reduction.
-  IRBuilder<> SB(StoreBlock);
-  SB.CreateStore(NewLo, VecLoArr);
-  SB.CreateStore(NewHi, VecHiArr);
-  SB.CreateBr(SumPre);
+  // TreeReduce: SVE register-only horizontal reduction (no memory access).
+  // Replaces the scalar strided-load + adds+adc loop that was the bottleneck
+  // (444 perf samples on ldr). Uses pairwise reduction via splice.left:
+  //   Level 1: rotate by 1 → pairwise add (N/2 independent 128-bit adds)
+  //   Level 2: rotate by 2 → pairwise add
+  //   ... until 1 element remains (lane 0)
+  // Each level uses sve_add_u128 (add + cmphi + zext + add) for carry.
+  // splice.left index is compile-time constant → lowers to SVE ext.
+  // Runtime check (N > stride) guards each level (skip if N too small).
+  //
+  // Critical path: log2(N) levels × (add+cmphi+add) vs N × (ldr+ldr+adds+adc).
+  // For N=4: 2 levels vs 4 iterations, and no memory access at all.
+  auto GenTreeLevel = [&](BasicBlock *&CurBB, Value *&CurLo, Value *&CurHi,
+                          int Stride) {
+    // Check: N > Stride?
+    BasicBlock *CheckBB = BasicBlock::Create(Ctx, "dpreroll.chk", &F);
+    BasicBlock *DoBB = BasicBlock::Create(Ctx, "dpreroll.lvl", &F);
+    BasicBlock *NextBB = BasicBlock::Create(Ctx, "dpreroll.next", &F);
 
-  // SumPre: branch to scalar reduction loop.
-  IRBuilder<> SP(SumPre);
-  SP.CreateBr(SumLoop);
+    IRBuilder<> CB(CheckBB);
+    Value *Cmp = CB.CreateICmpUGT(N, CB.getInt64(Stride),
+                                  ("dpreroll.gt" + Twine(Stride)).str());
+    CB.CreateCondBr(Cmp, DoBB, NextBB);
 
-  // SumLoop: scalar 128-bit add with carry over N elements.
-  // Uses @llvm.uadd.with.overflow for carry detection (ISel → adds+adc).
-  IRBuilder<> SL(SumLoop);
-  PHINode *SumIV = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_iv");
-  PHINode *SumLo = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_lo");
-  PHINode *SumHi = SL.CreatePHI(I64Ty, 2, "dpreroll.sum_hi");
+    // Do: rotate by Stride, sve_add_128
+    IRBuilder<> DB(DoBB);
+    Value *RotLo = DB.CreateIntrinsic(
+        Intrinsic::vector_splice_left, {Nxv2I64},
+        {CurLo, CurLo, DB.getInt32(Stride)}, {},
+        ("dpreroll.rot_lo" + Twine(Stride)).str());
+    Value *RotHi = DB.CreateIntrinsic(
+        Intrinsic::vector_splice_left, {Nxv2I64},
+        {CurHi, CurHi, DB.getInt32(Stride)}, {},
+        ("dpreroll.rot_hi" + Twine(Stride)).str());
 
-  // Load vec_lo[j] and vec_hi[j] (strided scalar load from separate arrays).
-  Value *LoPtr = SL.CreateGEP(I64Ty, VecLoArr, SumIV, "dpreroll.lo_ptr");
-  Value *HiPtr = SL.CreateGEP(I64Ty, VecHiArr, SumIV, "dpreroll.hi_ptr");
-  Value *TLo = SL.CreateLoad(I64Ty, LoPtr, "dpreroll.tlo");
-  Value *THi = SL.CreateLoad(I64Ty, HiPtr, "dpreroll.thi");
+    Value *SumLo = DB.CreateIntrinsic(
+        Intrinsic::aarch64_sve_add_u, {Nxv2I64}, {AllTrue, CurLo, RotLo}, {},
+        ("dpreroll.sum_lo" + Twine(Stride)).str());
+    Value *CarryPred = DB.CreateIntrinsic(
+        Intrinsic::aarch64_sve_cmphi, {Nxv2I64}, {AllTrue, CurLo, SumLo}, {},
+        ("dpreroll.carry" + Twine(Stride)).str());
+    Value *CarryVal = DB.CreateZExt(CarryPred, Nxv2I64,
+        ("dpreroll.cv" + Twine(Stride)).str());
+    Value *TmpHi = DB.CreateIntrinsic(
+        Intrinsic::aarch64_sve_add_u, {Nxv2I64}, {AllTrue, CurHi, RotHi}, {},
+        ("dpreroll.tmp_hi" + Twine(Stride)).str());
+    Value *SumHi = DB.CreateIntrinsic(
+        Intrinsic::aarch64_sve_add_u, {Nxv2I64}, {AllTrue, TmpHi, CarryVal}, {},
+        ("dpreroll.sum_hi" + Twine(Stride)).str());
+    DB.CreateBr(NextBB);
 
-  // 128-bit add with carry using @llvm.uadd.with.overflow.
-  Value *AddResult = SL.CreateIntrinsic(
-      Intrinsic::uadd_with_overflow, {I64Ty}, {SumLo, TLo}, {},
-      "dpreroll.add_lo");
-  Value *NewSumLo = SL.CreateExtractValue(AddResult, {0}, "dpreroll.new_sum_lo");
-  Value *Carry = SL.CreateExtractValue(AddResult, {1}, "dpreroll.carry");
-  Value *CarryExt = SL.CreateZExt(Carry, I64Ty, "dpreroll.carry_ext");
-  Value *Tmp = SL.CreateAdd(SumHi, THi, "dpreroll.tmp");
-  Value *NewSumHi = SL.CreateAdd(Tmp, CarryExt, "dpreroll.new_sum_hi");
+    // Connect CurBB → CheckBB
+    IRBuilder<> PrevB(CurBB);
+    PrevB.CreateBr(CheckBB);
 
-  // Loop bound = N (number of vector lanes).
-  Value *SumIVNext = SL.CreateAdd(SumIV, SL.getInt64(1),
-                                 "dpreroll.sum_iv_next");
-  Value *SumCmp = SL.CreateICmpULT(SumIVNext, N, "dpreroll.sum_cmp");
-  SL.CreateCondBr(SumCmp, SumLoop, AfterLoop);
+    // Phi in NextBB: pick SumLo/SumHi (if level ran) or CurLo/CurHi (skip)
+    IRBuilder<> NB(NextBB);
+    PHINode *NextLo = NB.CreatePHI(Nxv2I64, 2, ("dpreroll.nl" + Twine(Stride)).str());
+    PHINode *NextHi = NB.CreatePHI(Nxv2I64, 2, ("dpreroll.nh" + Twine(Stride)).str());
+    NextLo->addIncoming(CurLo, CheckBB);
+    NextLo->addIncoming(SumLo, DoBB);
+    NextHi->addIncoming(CurHi, CheckBB);
+    NextHi->addIncoming(SumHi, DoBB);
 
-  SumIV->addIncoming(SL.getInt64(0), SumPre);
-  SumIV->addIncoming(SumIVNext, SumLoop);
-  SumLo->addIncoming(SL.getInt64(0), SumPre);
-  SumLo->addIncoming(NewSumLo, SumLoop);
-  SumHi->addIncoming(SL.getInt64(0), SumPre);
-  SumHi->addIncoming(NewSumHi, SumLoop);
+    CurBB = NextBB;
+    CurLo = NextLo;
+    CurHi = NextHi;
+  };
 
-  // AfterLoop: branch to MergeBlock (Barrett reduce).
-  IRBuilder<> AB(AfterLoop);
-  AB.CreateBr(MergeBlock);
+  // Entry to tree reduction: TreeStart branches to first check level.
+  // TreeStart is already the exit target of VecLoop's condbr.
 
-  // Update MergeBlock's phi nodes to accept sum from AfterLoop.
-  AccLoPhi->addIncoming(NewSumLo, AfterLoop);
-  AccHiPhi->addIncoming(NewSumHi, AfterLoop);
+  // Generate levels: stride 1, 2, 4, 8, 16 (covers up to 32 elements)
+  BasicBlock *CurBB = TreeStart;
+  Value *CurLo = NewLo;
+  Value *CurHi = NewHi;
+  GenTreeLevel(CurBB, CurLo, CurHi, 1);
+  GenTreeLevel(CurBB, CurLo, CurHi, 2);
+  GenTreeLevel(CurBB, CurLo, CurHi, 4);
+  GenTreeLevel(CurBB, CurLo, CurHi, 8);
+  GenTreeLevel(CurBB, CurLo, CurHi, 16);
+
+  // Extract lane 0 → scalar result → feed to MergeBlock's phi
+  BasicBlock *ExtractBB = BasicBlock::Create(Ctx, "dpreroll.extract", &F);
+  {
+    IRBuilder<> EB(CurBB);
+    EB.CreateBr(ExtractBB);
+  }
+  IRBuilder<> EX(ExtractBB);
+  Value *ResultLo = EX.CreateExtractElement(CurLo, ConstantInt::get(I64Ty, 0),
+                                            "dpreroll.result_lo");
+  Value *ResultHi = EX.CreateExtractElement(CurHi, ConstantInt::get(I64Ty, 0),
+                                            "dpreroll.result_hi");
+  EX.CreateBr(MergeBlock);
+
+  // Update MergeBlock's phi nodes to accept result from ExtractBB.
+  AccLoPhi->addIncoming(ResultLo, ExtractBB);
+  AccHiPhi->addIncoming(ResultHi, ExtractBB);
 
   // Modify entry block: insert count check BEFORE the switch.
   // count==0 or count > 16 → switch (original behavior, including
